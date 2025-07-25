@@ -836,6 +836,7 @@ std::size_t Shuffler::spill(std::optional<std::size_t> amount) {
 
 detail::ChunkID Shuffler::get_new_cid() {
     // Place the counter in the first 38 bits (supports 256G chunks).
+    RAPIDSMPF_EXPECTS(chunk_id_counter_ < (1UL << 38L), "chunk ID beyond limit");
     std::uint64_t upper = ++chunk_id_counter_ << 26;
     // and place the rank in last 26 bits (supports 64M ranks).
     auto lower = static_cast<std::uint64_t>(comm_->rank());

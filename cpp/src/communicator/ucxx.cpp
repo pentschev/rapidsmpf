@@ -1154,6 +1154,8 @@ std::vector<std::unique_ptr<Communicator::Future>> UCXX::test_some(
         RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
         if (ucxx_future->req_->isCompleted()) {
             indices.push_back(i);
+        } else {
+            break;
         }
     }
     if (indices.size() == 0) {
@@ -1179,6 +1181,8 @@ std::vector<std::size_t> UCXX::test_some(
         RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
         if (ucxx_future->req_->isCompleted()) {
             completed.push_back(key);
+        } else {
+            break;
         }
     }
     return completed;

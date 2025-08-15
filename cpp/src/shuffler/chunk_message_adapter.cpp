@@ -12,10 +12,15 @@ ChunkMessageAdapter::ChunkMessageAdapter(detail::Chunk chunk)
     : chunk_(std::move(chunk)) {}
 
 ChunkMessageAdapter::ChunkMessageAdapter(std::uint64_t message_id)
-    : chunk_(detail::Chunk{}) {
+    : chunk_(
+          detail::Chunk::from_finished_partition(
+              static_cast<detail::ChunkID>(message_id),
+              0,  // dummy partition ID - will be set from metadata
+              1  // dummy expected count - will be set from metadata
+          )
+      ) {
     // Note: This constructor is used for deserialization - the actual chunk
     // will be reconstructed from metadata in a separate step
-    (void)message_id;  // Suppress unused parameter warning
 }
 
 std::uint64_t ChunkMessageAdapter::message_id() const {
@@ -31,7 +36,8 @@ void ChunkMessageAdapter::set_peer_rank(Rank rank) {
 }
 
 std::vector<std::uint8_t> ChunkMessageAdapter::serialize_metadata() const {
-    return chunk_.serialize();
+    auto serialized_ptr = chunk_.serialize();
+    return *serialized_ptr;  // Dereference the unique_ptr to get the vector
 }
 
 std::size_t ChunkMessageAdapter::total_data_size() const {

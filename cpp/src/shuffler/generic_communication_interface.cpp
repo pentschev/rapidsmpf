@@ -8,6 +8,8 @@
 #include <cstring>
 #include <utility>
 
+#include <cuda_runtime.h>
+
 #include <rapidsmpf/error.hpp>
 #include <rapidsmpf/shuffler/generic_communication_interface.hpp>
 #include <rapidsmpf/statistics.hpp>
@@ -45,7 +47,7 @@ void TagGenericCommunicationInterface::submit_outgoing_messages(
 
         auto metadata = message->serialize_metadata();
         fire_and_forget_.push_back(comm_->send(
-            br->move(std::make_unique<std::vector<std::uint8_t>>(std::move(metadata))),
+            std::make_unique<std::vector<std::uint8_t>>(std::move(metadata)),
             dst,
             metadata_tag_,
             br
@@ -116,9 +118,8 @@ void TagGenericCommunicationInterface::receive_metadata_phase(
         if (!msg)
             break;
 
-        auto const* msg_data = comm_->get_host_data(*msg);
-        std::vector<std::uint8_t> metadata(msg_data, msg_data + msg->size);
-        auto message = message_factory.create_from_metadata(metadata);
+        // The msg is already a vector<uint8_t>, so we can use it directly
+        auto message = message_factory.create_from_metadata(*msg);
         message->set_peer_rank(src);
         log.trace("recv_any from ", src, ": ", message->to_string());
         incoming_messages_.insert({src, std::move(message)});
@@ -179,7 +180,7 @@ void TagGenericCommunicationInterface::setup_data_receives_phase(
 
             auto ready_msg = ReadyForDataMessage{message_id};
             fire_and_forget_.push_back(comm_->send(
-                br->move(std::make_unique<std::vector<std::uint8_t>>(ready_msg.pack())),
+                std::make_unique<std::vector<std::uint8_t>>(ready_msg.pack()),
                 src,
                 ready_for_data_tag_,
                 br
@@ -203,8 +204,12 @@ void TagGenericCommunicationInterface::process_ready_acks_phase() {
         auto finished = comm_->test_some(futures);
         for (auto&& future : finished) {
             auto const msg_data = comm_->get_gpu_data(std::move(future));
-            auto const* host_data = comm_->get_host_data(*msg_data);
-            std::vector<std::uint8_t> data(host_data, host_data + msg_data->size);
+            // The msg_data should be a Buffer containing the message data
+            // We need to convert it to vector for processing
+            std::vector<std::uint8_t> data(msg_data->size);
+            RAPIDSMPF_CUDA_TRY(cudaMemcpy(
+                data.data(), msg_data->data(), msg_data->size, cudaMemcpyDeviceToHost
+            ));
             auto msg = ReadyForDataMessage::unpack(data);
 
             auto message_it = outgoing_messages_.find(msg.message_id);

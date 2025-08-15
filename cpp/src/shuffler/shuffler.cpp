@@ -174,7 +174,6 @@ class Shuffler::Progress {
         RAPIDSMPF_NVTX_SCOPED_RANGE("Shuffler.Progress", p_iters++);
         auto const t0_event_loop = Clock::now();
 
-        auto& log = shuffler_.comm_->logger();
         auto& stats = *shuffler_.statistics_;
 
         // Submit outgoing chunks to the communication interface using new generic
@@ -188,23 +187,24 @@ class Shuffler::Progress {
                 // Convert chunks to generic messages using adapter
                 auto messages = chunks_to_messages(std::move(ready_chunks));
 
-                // Define peer rank function for messages
-                auto peer_rank_fn = [&shuffler =
-                                         shuffler_](MessageInterface const& msg) -> Rank {
-                    // For ChunkMessageAdapter, we can get the partition from the first
-                    // message
-                    auto const& adapter = static_cast<ChunkMessageAdapter const&>(msg);
-                    auto dst = shuffler.partition_owner(
-                        shuffler.comm_, adapter.chunk().part_id(0)
-                    );
-                    shuffler.comm_->logger().trace(
-                        "submitting message to ", dst, ": ", msg.to_string()
-                    );
-                    RAPIDSMPF_EXPECTS(
-                        dst != shuffler.comm_->rank(), "sending message to ourselves"
-                    );
-                    return dst;
-                };
+                // Define peer rank function for messages (commented out since not used in
+                // current implementation) auto peer_rank_fn = [&shuffler =
+                //                          shuffler_](MessageInterface const& msg) ->
+                //                          Rank {
+                //     // For ChunkMessageAdapter, we can get the partition from the first
+                //     // message
+                //     auto const& adapter = static_cast<ChunkMessageAdapter const&>(msg);
+                //     auto dst = shuffler.partition_owner(
+                //         shuffler.comm_, adapter.chunk().part_id(0)
+                //     );
+                //     shuffler.comm_->logger().trace(
+                //         "submitting message to ", dst, ": ", msg.to_string()
+                //     );
+                //     RAPIDSMPF_EXPECTS(
+                //         dst != shuffler.comm_->rank(), "sending message to ourselves"
+                //     );
+                //     return dst;
+                // };
 
                 // Use the existing communication interface - for now we fall back to the
                 // old interface until we fully switch to the generic one

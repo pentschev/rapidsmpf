@@ -20,6 +20,7 @@
 #include <rapidsmpf/shuffler/chunk.hpp>
 #include <rapidsmpf/shuffler/communication_interface.hpp>
 #include <rapidsmpf/shuffler/finish_counter.hpp>
+#include <rapidsmpf/shuffler/generic_communication_interface.hpp>
 #include <rapidsmpf/shuffler/postbox.hpp>
 #include <rapidsmpf/statistics.hpp>
 #include <rapidsmpf/utils.hpp>
@@ -101,7 +102,7 @@ class Shuffler {
         BufferResource* br,
         std::shared_ptr<Statistics> statistics = Statistics::disabled(),
         PartitionOwner partition_owner = round_robin,
-        std::unique_ptr<CommunicationInterface> comm_interface = nullptr
+        std::unique_ptr<GenericCommunicationInterface> comm_interface = nullptr
     );
 
     ~Shuffler();
@@ -251,7 +252,7 @@ class Shuffler {
                                              ///< ready to be extracted by the user.
 
     std::shared_ptr<Communicator> comm_;
-    std::unique_ptr<CommunicationInterface> comm_interface_;
+    std::unique_ptr<GenericCommunicationInterface> comm_interface_;
     std::shared_ptr<ProgressThread> progress_thread_;
     ProgressThread::FunctionID progress_thread_function_id_;
     OpID const op_id_;

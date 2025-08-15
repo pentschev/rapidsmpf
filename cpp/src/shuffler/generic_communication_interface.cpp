@@ -206,11 +206,12 @@ void TagGenericCommunicationInterface::process_ready_acks_phase() {
             auto const msg_data = comm_->get_gpu_data(std::move(future));
             // The msg_data should be a Buffer containing the message data
             // We need to convert it to vector for processing
-            std::vector<std::uint8_t> data(msg_data->size);
-            RAPIDSMPF_CUDA_TRY(cudaMemcpy(
-                data.data(), msg_data->data(), msg_data->size, cudaMemcpyDeviceToHost
-            ));
-            auto msg = ReadyForDataMessage::unpack(data);
+            // std::vector<std::uint8_t> data(msg_data->size);
+            // RAPIDSMPF_CUDA_TRY(cudaMemcpy(
+            //     data.data(), msg_data->data(), msg_data->size, cudaMemcpyDeviceToHost
+            // ));
+            // auto msg = ReadyForDataMessage::unpack(data);
+            auto msg = ReadyForDataMessage::unpack(msg_data->data());
 
             auto message_it = outgoing_messages_.find(msg.message_id);
             RAPIDSMPF_EXPECTS(

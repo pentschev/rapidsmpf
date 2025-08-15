@@ -187,43 +187,28 @@ class Shuffler::Progress {
                 // Convert chunks to generic messages using adapter
                 auto messages = chunks_to_messages(std::move(ready_chunks));
 
-                // Define peer rank function for messages (commented out since not used in
-                // current implementation) auto peer_rank_fn = [&shuffler =
-                //                          shuffler_](MessageInterface const& msg) ->
-                //                          Rank {
-                //     // For ChunkMessageAdapter, we can get the partition from the first
-                //     // message
-                //     auto const& adapter = static_cast<ChunkMessageAdapter const&>(msg);
-                //     auto dst = shuffler.partition_owner(
-                //         shuffler.comm_, adapter.chunk().part_id(0)
-                //     );
-                //     shuffler.comm_->logger().trace(
-                //         "submitting message to ", dst, ": ", msg.to_string()
-                //     );
-                //     RAPIDSMPF_EXPECTS(
-                //         dst != shuffler.comm_->rank(), "sending message to ourselves"
-                //     );
-                //     return dst;
-                // };
-
-                // Use the existing communication interface - for now we fall back to the
-                // old interface until we fully switch to the generic one
-                //
-                // Future full integration would look like:
-                // if (shuffler_.generic_comm_interface_) {
-                //     shuffler_.generic_comm_interface_->submit_outgoing_messages(
-                //         std::move(messages), peer_rank_fn, shuffler_.br_
-                //     );
-                // } else {
-                //     // Fallback to old interface
-                auto chunks_for_old_interface = messages_to_chunks(std::move(messages));
-                auto partition_owner_fn = [&shuffler = shuffler_](PartID pid) -> Rank {
-                    return shuffler.partition_owner(shuffler.comm_, pid);
+                // Define peer rank function for messages
+                auto peer_rank_fn = [&shuffler =
+                                         shuffler_](MessageInterface const& msg) -> Rank {
+                    // For ChunkMessageAdapter, we can get the partition from the first
+                    // message
+                    auto const& adapter = static_cast<ChunkMessageAdapter const&>(msg);
+                    auto dst = shuffler.partition_owner(
+                        shuffler.comm_, adapter.chunk().part_id(0)
+                    );
+                    shuffler.comm_->logger().trace(
+                        "submitting message to ", dst, ": ", msg.to_string()
+                    );
+                    RAPIDSMPF_EXPECTS(
+                        dst != shuffler.comm_->rank(), "sending message to ourselves"
+                    );
+                    return dst;
                 };
-                shuffler_.comm_interface_->submit_outgoing_chunks(
-                    std::move(chunks_for_old_interface), partition_owner_fn, shuffler_.br_
+
+                // Use the new generic communication interface
+                shuffler_.comm_interface_->submit_outgoing_messages(
+                    std::move(messages), peer_rank_fn, shuffler_.br_
                 );
-                // }
             }
             stats.add_duration_stat(
                 "event-loop-submit-outgoing", Clock::now() - t0_submit_outgoing
@@ -241,25 +226,13 @@ class Shuffler::Progress {
                 return allocate_buffer(size, shuffler.stream_, shuffler.br_);
             };
 
-            // For now, continue using the old interface but show how the new abstraction
-            // would work
-            //
-            // Future full integration would look like:
-            // ChunkMessageFactory factory{allocate_buffer_fn};
-            // auto completed_messages =
-            // shuffler_.generic_comm_interface_->process_communication(
-            //     factory, shuffler_.stream_, shuffler_.br_
-            // );
-            // auto final_chunks = messages_to_chunks(std::move(completed_messages));
-            //
-            // For now, use old interface and demonstrate conversion:
-            auto completed_chunks = shuffler_.comm_interface_->process_communication(
-                allocate_buffer_fn, shuffler_.stream_, shuffler_.br_
+            // Use the new generic communication interface with ChunkMessageFactory
+            ChunkMessageFactory factory{allocate_buffer_fn};
+            auto completed_messages = shuffler_.comm_interface_->process_communication(
+                factory, shuffler_.stream_, shuffler_.br_
             );
 
-            // Convert completed chunks to messages and back to demonstrate the
-            // abstraction
-            auto completed_messages = chunks_to_messages(std::move(completed_chunks));
+            // Convert completed messages back to chunks for existing processing logic
             auto final_chunks = messages_to_chunks(std::move(completed_messages));
 
             // Process completed chunks and insert them into the ready postbox
@@ -334,7 +307,7 @@ Shuffler::Shuffler(
     BufferResource* br,
     std::shared_ptr<Statistics> statistics,
     PartitionOwner partition_owner,
-    std::unique_ptr<CommunicationInterface> comm_interface
+    std::unique_ptr<GenericCommunicationInterface> comm_interface
 )
     : total_num_partitions{total_num_partitions},
       partition_owner{partition_owner},
@@ -353,7 +326,7 @@ Shuffler::Shuffler(
       comm_{std::move(comm)},
       comm_interface_{
           comm_interface ? std::move(comm_interface)
-                         : std::make_unique<TagCommunicationInterface>(
+                         : std::make_unique<TagGenericCommunicationInterface>(
                                comm_, op_id, comm_->rank(), statistics
                            )
       },

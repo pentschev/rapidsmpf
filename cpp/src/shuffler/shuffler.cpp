@@ -16,7 +16,9 @@
 #include <rapidsmpf/communicator/communicator.hpp>
 #include <rapidsmpf/nvtx.hpp>
 #include <rapidsmpf/shuffler/chunk.hpp>
+#include <rapidsmpf/shuffler/chunk_message_adapter.hpp>
 #include <rapidsmpf/shuffler/communication_interface.hpp>
+#include <rapidsmpf/shuffler/generic_communication_interface.hpp>
 #include <rapidsmpf/shuffler/shuffler.hpp>
 #include <rapidsmpf/utils.hpp>
 
@@ -175,38 +177,61 @@ class Shuffler::Progress {
         auto& log = shuffler_.comm_->logger();
         auto& stats = *shuffler_.statistics_;
 
-        // Submit outgoing chunks to the communication interface
+        // Submit outgoing chunks to the communication interface using new generic
+        // abstraction
         {
             auto const t0_submit_outgoing = Clock::now();
             auto ready_chunks = shuffler_.outgoing_postbox_.extract_all_ready();
             RAPIDSMPF_NVTX_SCOPED_RANGE("submit_outgoing", ready_chunks.size());
 
             if (!ready_chunks.empty()) {
-                std::vector<detail::Chunk> chunks_to_submit;
-                for (auto&& chunk : ready_chunks) {
-                    auto dst =
-                        shuffler_.partition_owner(shuffler_.comm_, chunk.part_id(0));
-                    log.trace("submitting chunk to ", dst, ": ", chunk);
-                    RAPIDSMPF_EXPECTS(
-                        dst != shuffler_.comm_->rank(), "sending chunk to ourselves"
-                    );
-                    chunks_to_submit.push_back(std::move(chunk));
-                }
+                // Convert chunks to generic messages using adapter
+                auto messages = chunks_to_messages(std::move(ready_chunks));
 
+                // Define peer rank function for messages
+                auto peer_rank_fn = [&shuffler =
+                                         shuffler_](MessageInterface const& msg) -> Rank {
+                    // For ChunkMessageAdapter, we can get the partition from the first
+                    // message
+                    auto const& adapter = static_cast<ChunkMessageAdapter const&>(msg);
+                    auto dst = shuffler.partition_owner(
+                        shuffler.comm_, adapter.chunk().part_id(0)
+                    );
+                    shuffler.comm_->logger().trace(
+                        "submitting message to ", dst, ": ", msg.to_string()
+                    );
+                    RAPIDSMPF_EXPECTS(
+                        dst != shuffler.comm_->rank(), "sending message to ourselves"
+                    );
+                    return dst;
+                };
+
+                // Use the existing communication interface - for now we fall back to the
+                // old interface until we fully switch to the generic one
+                //
+                // Future full integration would look like:
+                // if (shuffler_.generic_comm_interface_) {
+                //     shuffler_.generic_comm_interface_->submit_outgoing_messages(
+                //         std::move(messages), peer_rank_fn, shuffler_.br_
+                //     );
+                // } else {
+                //     // Fallback to old interface
+                auto chunks_for_old_interface = messages_to_chunks(std::move(messages));
                 auto partition_owner_fn = [&shuffler = shuffler_](PartID pid) -> Rank {
                     return shuffler.partition_owner(shuffler.comm_, pid);
                 };
-
                 shuffler_.comm_interface_->submit_outgoing_chunks(
-                    std::move(chunks_to_submit), partition_owner_fn, shuffler_.br_
+                    std::move(chunks_for_old_interface), partition_owner_fn, shuffler_.br_
                 );
+                // }
             }
             stats.add_duration_stat(
                 "event-loop-submit-outgoing", Clock::now() - t0_submit_outgoing
             );
         }
 
-        // Process all communication operations and get completed chunks
+        // Process all communication operations and get completed chunks using new
+        // abstraction
         {
             auto const t0_process_comm = Clock::now();
             RAPIDSMPF_NVTX_SCOPED_RANGE("process_communication");
@@ -216,12 +241,29 @@ class Shuffler::Progress {
                 return allocate_buffer(size, shuffler.stream_, shuffler.br_);
             };
 
+            // For now, continue using the old interface but show how the new abstraction
+            // would work
+            //
+            // Future full integration would look like:
+            // ChunkMessageFactory factory{allocate_buffer_fn};
+            // auto completed_messages =
+            // shuffler_.generic_comm_interface_->process_communication(
+            //     factory, shuffler_.stream_, shuffler_.br_
+            // );
+            // auto final_chunks = messages_to_chunks(std::move(completed_messages));
+            //
+            // For now, use old interface and demonstrate conversion:
             auto completed_chunks = shuffler_.comm_interface_->process_communication(
                 allocate_buffer_fn, shuffler_.stream_, shuffler_.br_
             );
 
+            // Convert completed chunks to messages and back to demonstrate the
+            // abstraction
+            auto completed_messages = chunks_to_messages(std::move(completed_chunks));
+            auto final_chunks = messages_to_chunks(std::move(completed_messages));
+
             // Process completed chunks and insert them into the ready postbox
-            for (auto&& chunk : completed_chunks) {
+            for (auto&& chunk : final_chunks) {
                 // Validate ownership
                 RAPIDSMPF_EXPECTS(
                     shuffler_.partition_owner(shuffler_.comm_, chunk.part_id(0))

@@ -25,7 +25,15 @@ namespace {
 cuda::experimental::memory_pool_properties get_memory_pool_properties(
     PinnedPoolProperties const&
 ) {
-    return cuda::experimental::memory_pool_properties{};
+    return cuda::experimental::memory_pool_properties{
+        .initial_pool_size = 0,
+        .release_threshold = cuda::std::numeric_limits<size_t>::max(),
+        .allocation_handle_type =
+            static_cast<cuda::experimental::cudaMemAllocationHandleType>(
+                ::cudaMemHandleTypeFabric
+            )
+    };
+    // return cuda::experimental::memory_pool_properties{};
 }
 }  // namespace
 

@@ -32,6 +32,12 @@ class RapidsMPFPinnedDeviceMemoryResource : public rmm::mr::device_memory_resour
                 "RapidsMPF pinned memory resource is not supported on this CUDA version"
             );
         }
+        // rapidsmpf::PinnedPoolProperties properties{
+        //     // .initial_pool_size = 0,
+        //     // .release_threshold = cuda::std::numeric_limits<size_t>::max(),
+        //     .allocation_handle_type = cudaMemHandleTypeFabric
+        // };
+        // pool_ = std::make_unique<rapidsmpf::PinnedMemoryPool>(properties);
         pool_ = std::make_unique<rapidsmpf::PinnedMemoryPool>();
         resource_ = std::make_unique<rapidsmpf::PinnedMemoryResource>(*pool_);
     }

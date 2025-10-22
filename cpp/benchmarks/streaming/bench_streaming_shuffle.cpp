@@ -60,7 +60,7 @@ class ArgumentParser {
                            << "  -o <num>   Number of output partitions per rank "
                               "(default: 1)\n"
                            << "  -m <mr>    RMM memory resource {cuda, pool, async, "
-                              "managed} "
+                              "managed, pinned} "
                               "(default: pool)\n"
                            << "  -l <num>   Device memory limit in MiB (default:-1, "
                               "disabled)\n"
@@ -103,11 +103,11 @@ class ArgumentParser {
                 case 'm':
                     rmm_mr = std::string{optarg};
                     if (!(rmm_mr == "cuda" || rmm_mr == "pool" || rmm_mr == "async"
-                          || rmm_mr == "managed"))
+                          || rmm_mr == "managed" || rmm_mr == "pinned"))
                     {
                         if (rank == 0) {
                             std::cerr << "-m (RMM memory resource) must be one of "
-                                         "{cuda, pool, async, managed}"
+                                         "{cuda, pool, async, managed, pinned}"
                                       << std::endl;
                         }
                         RAPIDSMPF_MPI(MPI_Abort(MPI_COMM_WORLD, -1));

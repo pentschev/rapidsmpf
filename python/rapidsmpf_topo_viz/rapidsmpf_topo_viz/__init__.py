@@ -30,6 +30,7 @@ Build a Graphviz graph object for interactive use (e.g., Jupyter):
 
 from __future__ import annotations
 
+import json as _json
 from typing import TYPE_CHECKING, Any
 
 from rapidsmpf_topo_viz.renderer import (
@@ -69,6 +70,13 @@ def discover(*, enrich: bool = True) -> dict[str, Any]:
     RuntimeError
         If cuCascade topology discovery fails.
     """
+    viz = TopologyViz()
+    if not viz.discover():
+        msg = "Topology discovery failed"
+        raise RuntimeError(msg)
+    if not enrich:
+        return _json.loads(viz.to_json(indent=0))
+    return viz.to_dict()
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
@@ -96,6 +104,18 @@ def load_json(path: str | Path) -> dict[str, Any]:
     RuntimeError
         If the file is not valid JSON or required keys are missing.
     """
+    from pathlib import Path as _Path
+
+    p = _Path(path)
+    if not p.exists():
+        msg = f"File not found: {p}"
+        raise FileNotFoundError(msg)
+
+    viz = TopologyViz()
+    if not viz.load_json_file(str(p)):
+        msg = f"Failed to load JSON file: {p}"
+        raise RuntimeError(msg)
+    return viz.to_dict()
 
 
 def render(
@@ -129,6 +149,7 @@ def render(
     RuntimeError
         If Graphviz rendering fails (e.g., ``dot`` is not installed).
     """
+    return render_topology(topology, output, fmt=fmt)
 
 
 def discover_and_render(
@@ -156,3 +177,5 @@ def discover_and_render(
     Path
         The absolute path to the written file.
     """
+    topo = discover(enrich=enrich)
+    return render(topo, output, fmt=fmt)

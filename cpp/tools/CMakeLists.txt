@@ -107,3 +107,44 @@ install(
   DESTINATION bin
   EXCLUDE_FROM_ALL
 )
+
+set(TOPOLOGY_VIZ_SOURCES
+    "topology_viz.cpp"
+    "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/topology/json_io.cpp>"
+    "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/topology/bandwidth_discovery.cpp>"
+    "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/topology/system_enrichment.cpp>"
+    "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/topology/topology_viz.cpp>"
+    "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/system_info.cpp>"
+)
+add_executable(topology_viz ${TOPOLOGY_VIZ_SOURCES})
+set_target_properties(
+  topology_viz
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RAPIDSMPF_BINARY_DIR}/tools"
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(
+  topology_viz PRIVATE "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+)
+if(NVML_INCLUDE_DIR)
+  target_include_directories(topology_viz PRIVATE ${NVML_INCLUDE_DIR})
+endif()
+target_compile_options(
+  topology_viz PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>"
+)
+target_link_libraries(
+  topology_viz
+  PRIVATE cuCascade::cucascade
+          CUDA::nvml
+          $<$<TARGET_EXISTS:kvikio::kvikio>:kvikio::kvikio>
+          $<TARGET_NAME_IF_EXISTS:conda_env>
+          $<$<BOOL:${RAPIDSMPF_HAVE_NUMA}>:numa>
+          maybe_asan
+          ${CMAKE_DL_LIBS}
+)
+install(
+  TARGETS topology_viz
+  COMPONENT tools
+  DESTINATION bin
+  EXCLUDE_FROM_ALL
+)

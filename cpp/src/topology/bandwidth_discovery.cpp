@@ -1,0 +1,247 @@
+/**
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <string>
+
+#include <nvml.h>
+
+#include <rapidsmpf/topology/bandwidth_discovery.hpp>
+
+namespace rapidsmpf::topology {
+
+namespace {
+
+std::string read_sysfs(std::string const& path) {
+    std::ifstream f{path};
+    if (!f.is_open())
+        return {};
+    std::string line;
+    std::getline(f, line);
+    while (!line.empty()
+           && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
+    {
+        line.pop_back();
+    }
+    return line;
+}
+
+std::string normalize_pci_bus_id(std::string const& bus_id) {
+    std::string lower = bus_id;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return std::tolower(c);
+    });
+    // cuCascade uses "00000000:06:00.0" (8-char domain); sysfs uses "0000:06:00.0".
+    // Normalize to the 4-char domain form used by sysfs.
+    if (lower.size() > 12 && lower[4] == '0' && lower[5] == '0' && lower[6] == '0'
+        && lower[7] == '0' && lower[8] == ':')
+    {
+        lower = lower.substr(4);
+    }
+    return lower;
+}
+
+// Map GT/s string to PCIe generation and raw GT/s rate.
+struct pcie_speed_entry {
+    double gt_per_s;
+    int generation;
+};
+
+pcie_speed_entry parse_link_speed(std::string const& speed_str) {
+    // Format: "16.0 GT/s PCIe" or "16 GT/s"
+    double gt = 0;
+    std::sscanf(speed_str.c_str(), "%lf", &gt);
+
+    int gen = 0;
+    if (gt >= 63.0)
+        gen = 6;
+    else if (gt >= 31.0)
+        gen = 5;
+    else if (gt >= 15.0)
+        gen = 4;
+    else if (gt >= 7.0)
+        gen = 3;
+    else if (gt >= 4.0)
+        gen = 2;
+    else if (gt >= 2.0)
+        gen = 1;
+
+    return {gt, gen};
+}
+
+double compute_pcie_bandwidth(double gt_per_s, int width, int generation) {
+    // Gen1/Gen2: 8b/10b encoding → factor = 0.8
+    // Gen3+:     128b/130b encoding → factor ≈ 0.9846
+    double encoding = (generation <= 2) ? 0.8 : (128.0 / 130.0);
+    return gt_per_s * width * encoding / 8.0;
+}
+
+constexpr int kMaxNvLinks = 32;
+
+double nvlink_per_link_bandwidth(int version) {
+    // Unidirectional GB/s per sub-link
+    switch (version) {
+    case 1:
+        return 20.0;
+    case 2:
+        return 25.0;
+    case 3:
+        return 25.0;
+    case 4:
+        return 25.0;
+    case 5:
+        return 50.0;
+    default:
+        return 25.0;
+    }
+}
+
+}  // namespace
+
+pcie_info discover_pcie_info(std::string const& pci_bus_id) {
+    pcie_info info;
+    std::string sysfs_id = normalize_pci_bus_id(pci_bus_id);
+    std::string base = "/sys/bus/pci/devices/" + sysfs_id + "/";
+
+    std::string speed_str = read_sysfs(base + "max_link_speed");
+    std::string width_str = read_sysfs(base + "max_link_width");
+
+    if (speed_str.empty() || width_str.empty())
+        return info;
+
+    auto [gt_per_s, gen] = parse_link_speed(speed_str);
+    int width = 0;
+    try {
+        width = std::stoi(width_str);
+    } catch (...) {
+        return info;
+    }
+
+    info.generation = gen;
+    info.width = width;
+    info.bandwidth_gbps = compute_pcie_bandwidth(gt_per_s, width, gen);
+    return info;
+}
+
+std::vector<nvlink_connection> discover_nvlink_connections(unsigned int gpu_index) {
+    nvmlDevice_t device{};
+    if (nvmlDeviceGetHandleByIndex_v2(gpu_index, &device) != NVML_SUCCESS) {
+        return {};
+    }
+
+    // Collect per-link info keyed by remote PCI bus ID
+    struct peer_info {
+        std::string pci_bus_id;
+        int link_count{0};
+        int nvlink_version{0};
+    };
+
+    std::map<std::string, peer_info> peers;
+
+    for (int link = 0; link < kMaxNvLinks; ++link) {
+        nvmlEnableState_t active{};
+        if (nvmlDeviceGetNvLinkState(device, static_cast<unsigned int>(link), &active)
+            != NVML_SUCCESS)
+        {
+            break;
+        }
+        if (active != NVML_FEATURE_ENABLED)
+            continue;
+
+        nvmlPciInfo_t remote_pci{};
+        if (nvmlDeviceGetNvLinkRemotePciInfo_v2(
+                device, static_cast<unsigned int>(link), &remote_pci
+            )
+            != NVML_SUCCESS)
+        {
+            continue;
+        }
+
+        unsigned int version = 0;
+        nvmlDeviceGetNvLinkVersion(device, static_cast<unsigned int>(link), &version);
+
+        std::string remote_bus{remote_pci.busId};
+        auto& p = peers[normalize_pci_bus_id(remote_bus)];
+        p.pci_bus_id = remote_bus;
+        p.link_count++;
+        if (static_cast<int>(version) > p.nvlink_version) {
+            p.nvlink_version = static_cast<int>(version);
+        }
+    }
+
+    // Resolve remote PCI bus IDs to GPU indices
+    unsigned int device_count = 0;
+    nvmlDeviceGetCount_v2(&device_count);
+
+    std::map<std::string, unsigned int> pci_to_gpu;
+    for (unsigned int i = 0; i < device_count; ++i) {
+        nvmlDevice_t dev{};
+        if (nvmlDeviceGetHandleByIndex_v2(i, &dev) != NVML_SUCCESS)
+            continue;
+        nvmlPciInfo_t pci{};
+        if (nvmlDeviceGetPciInfo_v3(dev, &pci) != NVML_SUCCESS)
+            continue;
+        pci_to_gpu[normalize_pci_bus_id(std::string{pci.busId})] = i;
+    }
+
+    std::vector<nvlink_connection> result;
+    for (auto const& [pci_id, info] : peers) {
+        nvlink_connection conn;
+        auto it = pci_to_gpu.find(pci_id);
+        if (it != pci_to_gpu.end()) {
+            conn.peer_gpu_id = it->second;
+        }
+        conn.link_count = info.link_count;
+        conn.nvlink_version = info.nvlink_version;
+        conn.bandwidth_gbps =
+            info.link_count * nvlink_per_link_bandwidth(info.nvlink_version);
+        result.push_back(conn);
+    }
+    return result;
+}
+
+double discover_nic_speed(std::string const& nic_name) {
+    // Try InfiniBand rate first
+    std::string ib_rate =
+        read_sysfs("/sys/class/infiniband/" + nic_name + "/ports/1/rate");
+    if (!ib_rate.empty()) {
+        // Format: "400 Gb/sec" or "200 Gb/sec (4X HDR)"
+        double gbps = 0;
+        if (std::sscanf(ib_rate.c_str(), "%lf", &gbps) == 1 && gbps > 0) {
+            return gbps / 8.0;
+        }
+    }
+
+    // Try to find associated Ethernet netdev
+    std::string net_dir = "/sys/class/infiniband/" + nic_name + "/device/net/";
+    // Read the first entry in the net directory by checking common netdev names
+    // via the device symlink
+    std::string device_path = "/sys/class/infiniband/" + nic_name + "/device";
+
+    // Alternative: look for /sys/class/net/*/device -> same PCI device
+    // For now, try reading speed from the IB device's associated net interface
+    // by iterating known patterns
+    for (int port = 0; port < 2; ++port) {
+        std::string speed_str = read_sysfs(
+            "/sys/class/infiniband/" + nic_name + "/ports/" + std::to_string(port + 1)
+            + "/rate"
+        );
+        if (!speed_str.empty()) {
+            double gbps = 0;
+            if (std::sscanf(speed_str.c_str(), "%lf", &gbps) == 1 && gbps > 0) {
+                return gbps / 8.0;
+            }
+        }
+    }
+
+    return 0;
+}
+
+}  // namespace rapidsmpf::topology

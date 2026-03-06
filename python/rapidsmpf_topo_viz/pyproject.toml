@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+build-backend = "rapids_build_backend.build"
+requires = [
+    "rapids-build-backend>=0.4.0,<0.5.0",
+    "scikit-build-core[pyproject]>=0.11.0",
+]
+
+[project]
+name = "rapidsmpf-topo-viz"
+dynamic = ["version"]
+description = "Topology visualization for NVIDIA multi-GPU systems"
+readme = "README.md"
+authors = [
+    { name = "NVIDIA Corporation" },
+]
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "graphviz",
+    "click",
+]
+
+[project.scripts]
+rapidsmpf-topo-viz = "rapidsmpf_topo_viz.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/rapidsai/rapidsmpf"
+
+[tool.rapids-build-backend]
+build-backend = "scikit_build_core.build"
+dependencies-file = "../../dependencies.yaml"
+matrix-entry = "cuda_suffixed=true"
+requires = [
+    "cmake>=3.30.4",
+    "cython>=3.2.2",
+    "ninja",
+]
+
+[tool.scikit-build]
+build-dir = "build/{wheel_tag}"
+cmake.build-type = "Release"
+cmake.version = "CMakeLists.txt"
+minimum-version = "build-system.requires"
+ninja.make-fallback = true
+sdist.exclude = ["*tests*"]
+sdist.reproducible = true
+wheel.packages = ["rapidsmpf_topo_viz"]
+wheel.exclude = ["*.pyx", "*.pxd", "CMakeLists.txt"]
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "rapidsmpf_topo_viz/VERSION"
+regex = "(?P<value>.*)"

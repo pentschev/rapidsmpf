@@ -144,6 +144,7 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
         engine=engine,
         graph_attr={
             "rankdir": "TB",
+            "newrank": "true",
             "label": f"System Topology: {hostname}",
             "labelloc": "t",
             "fontname": FONT_NAME,
@@ -224,6 +225,33 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                     fillcolor=NIC_COLOR,
                     fontcolor=FONT_COLOR_LIGHT,
                 )
+
+    all_nic_ids = [f"nic_{nic['name']}" for nic in nics]
+    all_gpu_ids = [f"gpu_{gpu['id']}" for gpu in gpus]
+    all_cpu_ids = [f"cpu_numa{n}" for n in sorted(cpu_by_numa)]
+
+    if all_nic_ids:
+        with graph.subgraph(name="rank_nics") as s:
+            s.attr(rank="same")
+            for nid in all_nic_ids:
+                s.node(nid)
+
+    if all_gpu_ids:
+        with graph.subgraph(name="rank_gpus") as s:
+            s.attr(rank="same")
+            for nid in all_gpu_ids:
+                s.node(nid)
+
+    if all_cpu_ids:
+        with graph.subgraph(name="rank_cpus") as s:
+            s.attr(rank="same")
+            for nid in all_cpu_ids:
+                s.node(nid)
+
+    if all_nic_ids and all_gpu_ids:
+        graph.edge(all_nic_ids[0], all_gpu_ids[0], style="invis")
+    if all_gpu_ids and all_cpu_ids:
+        graph.edge(all_gpu_ids[0], all_cpu_ids[0], style="invis")
 
     # PCIe edges: GPU -> CPU
     for gpu in gpus:

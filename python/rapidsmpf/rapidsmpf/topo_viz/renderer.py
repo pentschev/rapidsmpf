@@ -359,7 +359,7 @@ def _nic_label(nic: dict[str, Any]) -> str:
     model = nic.get("model_name", "")
     if model:
         return f"{name}\\n{model}"
-    return name
+    return str(name)
 
 
 def _pcie_label(pcie: dict[str, Any]) -> str:

@@ -50,6 +50,31 @@ if(RAPIDSMPF_HAVE_UCXX)
 endif()
 find_package(CUDAToolkit REQUIRED)
 
+# cuCascade is needed by topo_viz (topology visualization Cython module).
+include(../../cmake/thirdparty/get_cucascade.cmake)
+
+# Locate NVML headers for topo_viz bandwidth discovery.
+find_path(
+  NVML_INCLUDE_DIR
+  NAMES nvml.h
+  HINTS ${CUDAToolkit_INCLUDE_DIRS}
+  PATH_SUFFIXES include
+)
+if(NOT NVML_INCLUDE_DIR)
+  if(DEFINED ENV{SITE_PACKAGES})
+    file(GLOB _nvml_sites "$ENV{SITE_PACKAGES}/nvidia/*/include")
+    foreach(_cand IN LISTS _nvml_sites)
+      if(EXISTS "${_cand}/nvml.h")
+        set(NVML_INCLUDE_DIR "${_cand}")
+        break()
+      endif()
+    endforeach()
+  endif()
+endif()
+if(NVML_INCLUDE_DIR)
+  message(STATUS "Found NVML headers at: ${NVML_INCLUDE_DIR}")
+endif()
+
 include(rapids-cython-core)
 rapids_cython_init()
 

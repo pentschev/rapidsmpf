@@ -13,18 +13,18 @@ Examples
 --------
 Discover the live system topology and render a diagram:
 
->>> import rapidsmpf_topo_viz as tv
->>> topo = tv.discover()
->>> tv.render(topo, "topology.png")
+>>> from rapidsmpf import topo_viz
+>>> topo = topo_viz.discover()
+>>> topo_viz.render(topo, "topology.png")
 
 Render from a previously-saved JSON file:
 
->>> topo = tv.load_json("topology.json")
->>> tv.render(topo, "topology.svg", fmt="svg")
+>>> topo = topo_viz.load_json("topology.json")
+>>> topo_viz.render(topo, "topology.svg", fmt="svg")
 
 Build a Graphviz graph object for interactive use (e.g., Jupyter):
 
->>> graph = tv.build_graph(topo)
+>>> graph = topo_viz.build_graph(topo)
 >>> graph  # renders inline as SVG in Jupyter
 """
 
@@ -33,11 +33,11 @@ from __future__ import annotations
 import json as _json
 from typing import TYPE_CHECKING, Any
 
-from rapidsmpf_topo_viz.renderer import (
+from rapidsmpf.topo_viz.renderer import (
     build_graph as build_graph,
     render_topology as render_topology,
 )
-from rapidsmpf_topo_viz.topology import TopologyViz as TopologyViz
+from rapidsmpf.topo_viz.topology import TopologyViz as TopologyViz
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -75,7 +75,8 @@ def discover(*, enrich: bool = True) -> dict[str, Any]:
         msg = "Topology discovery failed"
         raise RuntimeError(msg)
     if not enrich:
-        return _json.loads(viz.to_json(indent=0))
+        result: dict[str, Any] = _json.loads(viz.to_json(indent=0))
+        return result
     return viz.to_dict()
 
 

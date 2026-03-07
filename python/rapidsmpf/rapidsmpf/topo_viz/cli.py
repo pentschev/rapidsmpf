@@ -43,7 +43,7 @@ def main() -> None:
 )
 def discover(output: str | None) -> None:
     """Discover system topology and output enriched JSON."""
-    from rapidsmpf_topo_viz.topology import TopologyViz
+    from rapidsmpf.topo_viz.topology import TopologyViz
 
     viz = TopologyViz()
     if not viz.discover():
@@ -94,12 +94,16 @@ def render(
 
     If --json is not provided, runs live discovery first.
     """
-    import rapidsmpf_topo_viz as tv
+    from rapidsmpf import topo_viz
 
     if json_path is not None:
-        topo = tv.load_json(json_path)
+        topo = topo_viz.load_json(json_path)
     else:
-        topo = tv.discover()
+        topo = topo_viz.discover()
 
-    result = tv.render(topo, output, fmt=fmt)
+    result = topo_viz.render(topo, output, fmt=fmt)
     click.echo(f"Diagram written to {result}")
+
+
+if __name__ == "__main__":
+    main()

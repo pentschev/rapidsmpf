@@ -31,3 +31,5 @@ add_subdirectory(utils)
 if(RAPIDSMPF_HAVE_STREAMING)
   add_subdirectory(streaming)
 endif()
+
+add_subdirectory(topo_viz)

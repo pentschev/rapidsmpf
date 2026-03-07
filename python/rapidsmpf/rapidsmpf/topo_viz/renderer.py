@@ -403,6 +403,12 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
             fillcolor=NETWORK_COLOR,
             fontcolor=FONT_COLOR_LIGHT,
         )
+        # Single invisible constraining edge to place Network below NICs
+        graph.edge(
+            f"nic_{nics_with_speed[0]['name']}",
+            "network",
+            style="invis",
+        )
         for nic in nics_with_speed:
             bw = nic["bandwidth_gbps"]
             speed_bits = bw * 8
@@ -414,6 +420,7 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 color=NETWORK_COLOR,
                 fontcolor=NETWORK_COLOR,
                 style="bold",
+                constraint="false",
             )
 
     return graph

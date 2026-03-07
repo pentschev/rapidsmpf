@@ -78,6 +78,10 @@ void enrich_topology(system_topology& topo) {
         }
     }
 
+    if (topo.pcie_switches.empty()) {
+        topo.pcie_switches = discover_pcie_switches(topo.gpus, topo.network_devices);
+    }
+
     if (topo.cpus.empty() && topo.num_numa_nodes > 0) {
         topo.cpus = discover_cpus(topo.num_numa_nodes);
     }

@@ -51,6 +51,25 @@ namespace rapidsmpf::topology {
 );
 
 /**
+ * @brief Discover PCIe switches connecting GPUs and NICs to the CPU.
+ *
+ * Walks the sysfs PCI hierarchy from each GPU and NIC to find intermediate
+ * PCIe switches (PCI-to-PCI bridges, class 0x0604).  Devices sharing the
+ * same switch upstream port are grouped together.  Only switches with at
+ * least one GPU or NIC are returned.
+ *
+ * @param gpus  GPU topology info (needs valid `pci_bus_id` fields).
+ * @param nics  Network device info (needs valid `pci_bus_id` fields).
+ *
+ * @return A vector of `pcie_switch_info`, one per discovered switch.
+ *         Empty if no switches are found or sysfs is inaccessible.
+ */
+[[nodiscard]] std::vector<pcie_switch_info> discover_pcie_switches(
+    std::vector<gpu_topology_info> const& gpus,
+    std::vector<network_device_info> const& nics
+);
+
+/**
  * @brief Discover the link speed of a network device.
  *
  * Tries the following sources in order:

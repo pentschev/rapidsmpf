@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 GPU_COLOR = "#76B900"
 CPU_COLOR = "#0076CE"
 NIC_COLOR = "#FF6F00"
+SWITCH_COLOR = "#9B59B6"
 NVLINK_COLOR = "#76B900"
 PCIE_COLOR = "#4A90D9"
 NETWORK_COLOR = "#888888"
@@ -77,10 +78,11 @@ def render_topology(
     - **GPUs** are green rectangles (#76B900) with white text.
     - **CPUs** are blue rectangles (#0076CE) with white text.
     - **NICs** are orange rectangles (#FF6F00) with white text.
+    - **PCIe Switches** are purple rectangles (#9B59B6) with white text.
     - **NVLink** edges are thick green lines.
-    - **PCIe** edges are dashed blue lines.
+    - **PCIe** edges are dashed blue lines (endpoint to switch, switch to CPU).
     - **Network speed** is annotated on an edge to an abstract *Network*
-      node, or directly on the NIC label when speed is known.
+      node.
 
     When a bandwidth or name field is zero / empty the corresponding label
     element is simply omitted (graceful degradation for partial JSON input).
@@ -159,9 +161,21 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
     gpus = topology.get("gpus", [])
     nics = topology.get("network_devices", [])
     cpus = topology.get("cpus", [])
+    switches = topology.get("pcie_switches", [])
 
     gpus.sort(key=lambda g: (g.get("numa_node", -1), g.get("id", 0)))
     nics.sort(key=lambda n: (n.get("numa_node", -1), n.get("name", "")))
+    switches.sort(key=lambda s: (s.get("numa_node", -1), s.get("pci_bus_id", "")))
+
+    # Build lookup: which switch does each GPU / NIC belong to?
+    gpu_to_switch: dict[int, str] = {}
+    nic_to_switch: dict[str, str] = {}
+    for sw in switches:
+        sw_id = sw["pci_bus_id"]
+        for gid in sw.get("gpu_ids", []):
+            gpu_to_switch[gid] = sw_id
+        for nn in sw.get("nic_names", []):
+            nic_to_switch[nn] = sw_id
 
     numa_gpus: dict[int, list[dict]] = {}
     for gpu in gpus:
@@ -173,11 +187,20 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
         node = nic.get("numa_node", -1)
         numa_nics.setdefault(node, []).append(nic)
 
+    numa_switches: dict[int, list[dict]] = {}
+    for sw in switches:
+        node = sw.get("numa_node", -1)
+        numa_switches.setdefault(node, []).append(sw)
+
     cpu_by_numa: dict[int, dict] = {}
     for cpu in cpus:
         cpu_by_numa[cpu.get("numa_node", -1)] = cpu
 
-    all_numa = sorted(set(list(numa_gpus.keys()) + list(numa_nics.keys())))
+    all_numa = sorted(
+        set(
+            list(numa_gpus.keys()) + list(numa_nics.keys()) + list(numa_switches.keys())
+        )
+    )
 
     for numa_node in all_numa:
         cluster_name = f"cluster_numa{numa_node}"
@@ -193,6 +216,7 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 fontsize="12",
             )
 
+            # Tier 1: GPUs (top)
             local_gpu_ids: list[str] = []
             for gpu in numa_gpus.get(numa_node, []):
                 gpu_id = f"gpu_{gpu['id']}"
@@ -206,6 +230,7 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 )
                 local_gpu_ids.append(gpu_id)
 
+            # Tier 2: CPU
             cpu_id = None
             cpu_info = cpu_by_numa.get(numa_node)
             if cpu_info is not None:
@@ -220,6 +245,21 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                     fontcolor=FONT_COLOR_LIGHT,
                 )
 
+            # Tier 3: PCIe Switches
+            local_sw_ids: list[str] = []
+            for sw in numa_switches.get(numa_node, []):
+                sw_id = f"sw_{_sanitize_bdf(sw['pci_bus_id'])}"
+                sub.node(
+                    sw_id,
+                    label=_switch_label(sw),
+                    shape="box",
+                    style="filled,rounded",
+                    fillcolor=SWITCH_COLOR,
+                    fontcolor=FONT_COLOR_LIGHT,
+                )
+                local_sw_ids.append(sw_id)
+
+            # Tier 4: NICs (bottom)
             local_nic_ids: list[str] = []
             for nic in numa_nics.get(numa_node, []):
                 nic_id = f"nic_{nic['name']}"
@@ -233,40 +273,95 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 )
                 local_nic_ids.append(nic_id)
 
-            if local_gpu_ids and cpu_id:
-                sub.edge(local_gpu_ids[0], cpu_id, style="invis")
-            for nic_id in local_nic_ids:
+            # Invisible edges to enforce tier ordering within cluster.
+            # Use middle elements as anchors to horizontally center
+            # dependent tiers.
+            mid_gpu = local_gpu_ids[len(local_gpu_ids) // 2] if local_gpu_ids else None
+            mid_sw = local_sw_ids[len(local_sw_ids) // 2] if local_sw_ids else None
+            # GPUs -> CPU -> Switches -> NICs
+            if mid_gpu and cpu_id:
+                sub.edge(mid_gpu, cpu_id, style="invis")
+            for sw_id in local_sw_ids:
                 if cpu_id:
+                    sub.edge(cpu_id, sw_id, style="invis")
+                elif mid_gpu:
+                    sub.edge(mid_gpu, sw_id, style="invis")
+            for nic_id in local_nic_ids:
+                if mid_sw:
+                    sub.edge(mid_sw, nic_id, style="invis")
+                elif cpu_id:
                     sub.edge(cpu_id, nic_id, style="invis")
-                elif local_gpu_ids:
-                    sub.edge(local_gpu_ids[0], nic_id, style="invis")
+                elif mid_gpu:
+                    sub.edge(mid_gpu, nic_id, style="invis")
 
-    # PCIe edges: GPU -> CPU
+    # PCIe edges: GPU -> Switch (or GPU -> CPU if no switch)
     for gpu in gpus:
-        numa_node = gpu.get("numa_node", -1)
-        if numa_node in cpu_by_numa:
-            gpu_id = f"gpu_{gpu['id']}"
-            cpu_id = f"cpu_numa{numa_node}"
+        gpu_id_num = gpu.get("id", 0)
+        gpu_node = f"gpu_{gpu_id_num}"
+        sw_bdf = gpu_to_switch.get(gpu_id_num)
+        if sw_bdf:
             label = _pcie_label(gpu.get("pcie", {}))
             graph.edge(
-                gpu_id,
-                cpu_id,
+                gpu_node,
+                f"sw_{_sanitize_bdf(sw_bdf)}",
                 label=label,
                 style="dashed",
                 color=PCIE_COLOR,
                 fontcolor=PCIE_COLOR,
+                constraint="false",
             )
+        else:
+            numa_node = gpu.get("numa_node", -1)
+            if numa_node in cpu_by_numa:
+                label = _pcie_label(gpu.get("pcie", {}))
+                graph.edge(
+                    gpu_node,
+                    f"cpu_numa{numa_node}",
+                    label=label,
+                    style="dashed",
+                    color=PCIE_COLOR,
+                    fontcolor=PCIE_COLOR,
+                )
 
-    # PCIe edges: NIC -> CPU (non-constraining; NICs are ranked below CPUs)
+    # PCIe edges: NIC -> Switch (or NIC -> CPU if no switch)
     for nic in nics:
-        numa_node = nic.get("numa_node", -1)
-        if numa_node in cpu_by_numa:
-            nic_id = f"nic_{nic['name']}"
-            cpu_id = f"cpu_numa{numa_node}"
+        nic_name = nic.get("name", "")
+        nic_node = f"nic_{nic_name}"
+        sw_bdf = nic_to_switch.get(nic_name)
+        if sw_bdf:
             label = _pcie_label(nic.get("pcie", {}))
             graph.edge(
-                nic_id,
-                cpu_id,
+                nic_node,
+                f"sw_{_sanitize_bdf(sw_bdf)}",
+                label=label,
+                style="dashed",
+                color=PCIE_COLOR,
+                fontcolor=PCIE_COLOR,
+                constraint="false",
+            )
+        else:
+            numa_node = nic.get("numa_node", -1)
+            if numa_node in cpu_by_numa:
+                label = _pcie_label(nic.get("pcie", {}))
+                graph.edge(
+                    nic_node,
+                    f"cpu_numa{numa_node}",
+                    label=label,
+                    style="dashed",
+                    color=PCIE_COLOR,
+                    fontcolor=PCIE_COLOR,
+                    constraint="false",
+                )
+
+    # PCIe edges: Switch -> CPU (upstream link)
+    for sw in switches:
+        sw_node = f"sw_{_sanitize_bdf(sw['pci_bus_id'])}"
+        numa_node = sw.get("numa_node", -1)
+        if numa_node in cpu_by_numa:
+            label = _pcie_label(sw.get("pcie", {}))
+            graph.edge(
+                sw_node,
+                f"cpu_numa{numa_node}",
                 label=label,
                 style="dashed",
                 color=PCIE_COLOR,
@@ -324,6 +419,11 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
     return graph
 
 
+def _sanitize_bdf(bdf: str) -> str:
+    """Replace characters that Graphviz interprets as port separators."""
+    return bdf.replace(":", "_").replace(".", "_")
+
+
 def _gpu_label(gpu: dict[str, Any]) -> str:
     name = gpu.get("name", "")
     gpu_id = gpu.get("id", "?")
@@ -350,6 +450,11 @@ def _nic_label(nic: dict[str, Any]) -> str:
     if model:
         return f"{name}\\n{model}"
     return str(name)
+
+
+def _switch_label(sw: dict[str, Any]) -> str:
+    bdf = sw.get("pci_bus_id", "?")
+    return f"PCIe Switch\\n{bdf}"
 
 
 def _pcie_label(pcie: dict[str, Any]) -> str:

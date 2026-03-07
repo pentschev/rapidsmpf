@@ -582,6 +582,39 @@ gpu_topology_info parse_gpu(json_value const& val) {
     return gpu;
 }
 
+std::vector<unsigned int> parse_uint_array(json_value const& val) {
+    std::vector<unsigned int> result;
+    if (!val.is_array())
+        return result;
+    for (auto const& elem : val.as_array()) {
+        if (elem.is_number())
+            result.push_back(elem.as_uint());
+    }
+    return result;
+}
+
+pcie_switch_info parse_pcie_switch(json_value const& val) {
+    pcie_switch_info sw;
+    if (!val.is_object())
+        return sw;
+    sw.pci_bus_id = val.get_string("pci_bus_id");
+    sw.numa_node = val.get_int("numa_node", -1);
+
+    auto const* pci = val.find("pcie");
+    if (pci != nullptr)
+        sw.pcie = parse_pcie(*pci);
+
+    auto const* gids = val.find("gpu_ids");
+    if (gids != nullptr)
+        sw.gpu_ids = parse_uint_array(*gids);
+
+    auto const* nnames = val.find("nic_names");
+    if (nnames != nullptr)
+        sw.nic_names = parse_string_array(*nnames);
+
+    return sw;
+}
+
 network_device_info parse_network_device(json_value const& val) {
     network_device_info dev;
     if (!val.is_object())
@@ -620,6 +653,16 @@ void write_int_array(json_writer& w, std::vector<int> const& vec) {
         if (i > 0)
             w.array_element_sep();
         w.value_int(vec[i]);
+    }
+    w.end_array();
+}
+
+void write_uint_array(json_writer& w, std::vector<unsigned int> const& vec) {
+    w.begin_array();
+    for (std::size_t i = 0; i < vec.size(); ++i) {
+        if (i > 0)
+            w.array_element_sep();
+        w.value_uint(vec[i]);
     }
     w.end_array();
 }
@@ -750,6 +793,27 @@ std::string to_json(system_topology const& topo, int indent) {
     }
     w.end_array();
 
+    w.key("pcie_switches");
+    w.begin_array();
+    for (std::size_t i = 0; i < topo.pcie_switches.size(); ++i) {
+        if (i > 0)
+            w.array_element_sep();
+        auto const& sw = topo.pcie_switches[i];
+        w.begin_object();
+        w.key("pci_bus_id");
+        w.value_string(sw.pci_bus_id);
+        w.key("numa_node");
+        w.value_int(sw.numa_node);
+        w.key("pcie");
+        write_pcie(w, sw.pcie);
+        w.key("gpu_ids");
+        write_uint_array(w, sw.gpu_ids);
+        w.key("nic_names");
+        write_string_array(w, sw.nic_names);
+        w.end_object();
+    }
+    w.end_array();
+
     w.end_object();
     if (indent > 0) {
         return w.str() + "\n";
@@ -793,6 +857,13 @@ system_topology from_json(std::string const& json_str) {
     if (nds != nullptr && nds->is_array()) {
         for (auto const& elem : nds->as_array()) {
             topo.network_devices.push_back(parse_network_device(elem));
+        }
+    }
+
+    auto const* sws = root.find("pcie_switches");
+    if (sws != nullptr && sws->is_array()) {
+        for (auto const& elem : sws->as_array()) {
+            topo.pcie_switches.push_back(parse_pcie_switch(elem));
         }
     }
 

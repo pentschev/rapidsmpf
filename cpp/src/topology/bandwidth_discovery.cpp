@@ -4,10 +4,13 @@
  */
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <map>
+#include <regex>
 #include <sstream>
 #include <string>
 
@@ -204,6 +207,131 @@ std::vector<nvlink_connection> discover_nvlink_connections(unsigned int gpu_inde
             info.link_count * nvlink_per_link_bandwidth(info.nvlink_version);
         result.push_back(conn);
     }
+    return result;
+}
+
+namespace {
+
+bool is_pci_bdf(std::string const& name) {
+    // Match DDDD:BB:DD.F pattern (e.g., "0000:06:00.0")
+    static std::regex const re{
+        R"([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F])"
+    };
+    return std::regex_match(name, re);
+}
+
+std::string basename_of(std::string const& path) {
+    auto pos = path.rfind('/');
+    if (pos == std::string::npos)
+        return path;
+    return path.substr(pos + 1);
+}
+
+std::string dirname_of(std::string const& path) {
+    auto pos = path.rfind('/');
+    if (pos == std::string::npos)
+        return ".";
+    if (pos == 0)
+        return "/";
+    return path.substr(0, pos);
+}
+
+bool is_pci_bridge(std::string const& bdf) {
+    std::string cls = read_sysfs("/sys/bus/pci/devices/" + bdf + "/class");
+    // PCI-to-PCI bridge class: 0x0604XX
+    return cls.size() >= 6 && cls.substr(0, 6) == "0x0604";
+}
+
+// Walk sysfs from a PCI endpoint up to find the switch upstream port.
+// Returns the BDF of the switch upstream port, or empty if none found.
+//
+// Typical sysfs path:
+//   .../root_port/switch_upstream/switch_downstream/device
+// Bridge ancestors (device toward root): [downstream, upstream, root_port]
+// The switch upstream port is bridges[1] (second from device).
+// If fewer than 2 bridges exist, the device is directly on a root port.
+std::string find_parent_switch(std::string const& pci_bus_id) {
+    std::string norm = normalize_pci_bus_id(pci_bus_id);
+    std::string device_link = "/sys/bus/pci/devices/" + norm;
+
+    char resolved[PATH_MAX];
+    if (realpath(device_link.c_str(), resolved) == nullptr)
+        return {};
+
+    std::string current{resolved};
+
+    std::vector<std::string> bridges;
+    while (true) {
+        current = dirname_of(current);
+        std::string name = basename_of(current);
+
+        if (!is_pci_bdf(name))
+            break;
+
+        if (is_pci_bridge(name)) {
+            bridges.push_back(name);
+        }
+    }
+
+    // bridges[0] = downstream port (closest to device)
+    // bridges[1] = upstream port (the switch we want)
+    // bridges[last] = root port
+    if (bridges.size() >= 2) {
+        return bridges[1];
+    }
+    return {};
+}
+
+}  // namespace
+
+std::vector<pcie_switch_info> discover_pcie_switches(
+    std::vector<gpu_topology_info> const& gpus,
+    std::vector<network_device_info> const& nics
+) {
+    // Map switch BDF -> (gpu_ids, nic_names)
+    std::map<std::string, std::pair<std::vector<unsigned int>, std::vector<std::string>>>
+        switch_devices;
+
+    for (auto const& gpu : gpus) {
+        if (gpu.pci_bus_id.empty())
+            continue;
+        std::string sw = find_parent_switch(gpu.pci_bus_id);
+        if (!sw.empty()) {
+            switch_devices[sw].first.push_back(gpu.id);
+        }
+    }
+
+    for (auto const& nic : nics) {
+        if (nic.pci_bus_id.empty())
+            continue;
+        std::string sw = find_parent_switch(nic.pci_bus_id);
+        if (!sw.empty()) {
+            switch_devices[sw].second.push_back(nic.name);
+        }
+    }
+
+    std::vector<pcie_switch_info> result;
+    for (auto& [bdf, devices] : switch_devices) {
+        pcie_switch_info info;
+        info.pci_bus_id = bdf;
+        info.gpu_ids = std::move(devices.first);
+        info.nic_names = std::move(devices.second);
+
+        // Read NUMA node
+        std::string numa_str = read_sysfs("/sys/bus/pci/devices/" + bdf + "/numa_node");
+        if (!numa_str.empty()) {
+            try {
+                info.numa_node = std::stoi(numa_str);
+            } catch (...) {
+            }
+        }
+
+        // Discover upstream PCIe link bandwidth
+        info.pcie = discover_pcie_info(bdf);
+
+        result.push_back(std::move(info));
+    }
+
     return result;
 }
 

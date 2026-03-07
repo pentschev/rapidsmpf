@@ -93,6 +93,21 @@ struct network_device_info {
 };
 
 /**
+ * @brief PCIe switch information.
+ *
+ * Represents a PCIe switch (identified by its upstream port BDF) and the
+ * set of GPUs and NICs connected through its downstream ports.  Discovered
+ * by walking the sysfs PCI hierarchy from each endpoint device.
+ */
+struct pcie_switch_info {
+    std::string pci_bus_id;  ///< Upstream port BDF, e.g. "0000:01:00.0".
+    int numa_node{-1};  ///< NUMA node. -1 = unknown.
+    pcie_info pcie;  ///< PCIe link from upstream port to parent (root port).
+    std::vector<unsigned int> gpu_ids;  ///< GPU indices behind this switch.
+    std::vector<std::string> nic_names;  ///< NIC kernel names behind this switch.
+};
+
+/**
  * @brief Complete enriched system topology.
  *
  * Produced by `topology_viz::discover()` or loaded from JSON via
@@ -108,6 +123,7 @@ struct system_topology {
     std::vector<cpu_topology_info> cpus;  ///< Per-NUMA-node CPU information.
     std::vector<gpu_topology_info> gpus;  ///< Per-GPU topology information.
     std::vector<network_device_info> network_devices;  ///< Per-NIC information.
+    std::vector<pcie_switch_info> pcie_switches;  ///< PCIe switches with endpoints.
 };
 
 }  // namespace rapidsmpf::topology

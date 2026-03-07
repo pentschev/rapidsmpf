@@ -47,6 +47,14 @@ cdef extern from "<rapidsmpf/topology/types.hpp>" nogil:
         double bandwidth_gbps
         cpp_pcie_info pcie
 
+    cdef struct cpp_pcie_switch_info \
+            "rapidsmpf::topology::pcie_switch_info":
+        string pci_bus_id
+        int numa_node
+        cpp_pcie_info pcie
+        vector[unsigned int] gpu_ids
+        vector[string] nic_names
+
     cdef struct cpp_system_topology "rapidsmpf::topology::system_topology":
         string hostname
         unsigned int num_gpus
@@ -55,6 +63,7 @@ cdef extern from "<rapidsmpf/topology/types.hpp>" nogil:
         vector[cpp_cpu_topology_info] cpus
         vector[cpp_gpu_topology_info] gpus
         vector[cpp_network_device_info] network_devices
+        vector[cpp_pcie_switch_info] pcie_switches
 
 
 cdef extern from "<rapidsmpf/topology/topology_viz.hpp>" nogil:

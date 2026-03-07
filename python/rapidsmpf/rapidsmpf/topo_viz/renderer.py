@@ -144,7 +144,6 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
         engine=engine,
         graph_attr={
             "rankdir": "TB",
-            "newrank": "true",
             "label": f"System Topology: {hostname}",
             "labelloc": "t",
             "fontname": FONT_NAME,
@@ -160,6 +159,9 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
     gpus = topology.get("gpus", [])
     nics = topology.get("network_devices", [])
     cpus = topology.get("cpus", [])
+
+    gpus.sort(key=lambda g: (g.get("numa_node", -1), g.get("id", 0)))
+    nics.sort(key=lambda n: (n.get("numa_node", -1), n.get("name", "")))
 
     numa_gpus: dict[int, list[dict]] = {}
     for gpu in gpus:
@@ -191,6 +193,20 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 fontsize="12",
             )
 
+            local_gpu_ids: list[str] = []
+            for gpu in numa_gpus.get(numa_node, []):
+                gpu_id = f"gpu_{gpu['id']}"
+                sub.node(
+                    gpu_id,
+                    label=_gpu_label(gpu),
+                    shape="box",
+                    style="filled,rounded",
+                    fillcolor=GPU_COLOR,
+                    fontcolor=FONT_COLOR_LIGHT,
+                )
+                local_gpu_ids.append(gpu_id)
+
+            cpu_id = None
             cpu_info = cpu_by_numa.get(numa_node)
             if cpu_info is not None:
                 cpu_label = _cpu_label(cpu_info)
@@ -204,17 +220,7 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                     fontcolor=FONT_COLOR_LIGHT,
                 )
 
-            for gpu in numa_gpus.get(numa_node, []):
-                gpu_id = f"gpu_{gpu['id']}"
-                sub.node(
-                    gpu_id,
-                    label=_gpu_label(gpu),
-                    shape="box",
-                    style="filled,rounded",
-                    fillcolor=GPU_COLOR,
-                    fontcolor=FONT_COLOR_LIGHT,
-                )
-
+            local_nic_ids: list[str] = []
             for nic in numa_nics.get(numa_node, []):
                 nic_id = f"nic_{nic['name']}"
                 sub.node(
@@ -225,33 +231,15 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                     fillcolor=NIC_COLOR,
                     fontcolor=FONT_COLOR_LIGHT,
                 )
+                local_nic_ids.append(nic_id)
 
-    all_nic_ids = [f"nic_{nic['name']}" for nic in nics]
-    all_gpu_ids = [f"gpu_{gpu['id']}" for gpu in gpus]
-    all_cpu_ids = [f"cpu_numa{n}" for n in sorted(cpu_by_numa)]
-
-    if all_nic_ids:
-        with graph.subgraph(name="rank_nics") as s:
-            s.attr(rank="same")
-            for nid in all_nic_ids:
-                s.node(nid)
-
-    if all_gpu_ids:
-        with graph.subgraph(name="rank_gpus") as s:
-            s.attr(rank="same")
-            for nid in all_gpu_ids:
-                s.node(nid)
-
-    if all_cpu_ids:
-        with graph.subgraph(name="rank_cpus") as s:
-            s.attr(rank="same")
-            for nid in all_cpu_ids:
-                s.node(nid)
-
-    if all_nic_ids and all_gpu_ids:
-        graph.edge(all_nic_ids[0], all_gpu_ids[0], style="invis")
-    if all_gpu_ids and all_cpu_ids:
-        graph.edge(all_gpu_ids[0], all_cpu_ids[0], style="invis")
+            if local_gpu_ids and cpu_id:
+                sub.edge(local_gpu_ids[0], cpu_id, style="invis")
+            for nic_id in local_nic_ids:
+                if cpu_id:
+                    sub.edge(cpu_id, nic_id, style="invis")
+                elif local_gpu_ids:
+                    sub.edge(local_gpu_ids[0], nic_id, style="invis")
 
     # PCIe edges: GPU -> CPU
     for gpu in gpus:
@@ -269,7 +257,7 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 fontcolor=PCIE_COLOR,
             )
 
-    # PCIe edges: NIC -> CPU
+    # PCIe edges: NIC -> CPU (non-constraining; NICs are ranked below CPUs)
     for nic in nics:
         numa_node = nic.get("numa_node", -1)
         if numa_node in cpu_by_numa:
@@ -283,6 +271,7 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 style="dashed",
                 color=PCIE_COLOR,
                 fontcolor=PCIE_COLOR,
+                constraint="false",
             )
 
     # NVLink edges (deduplicated: only draw A->B where A < B)
@@ -305,6 +294,7 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 penwidth="2.5",
                 fontcolor=NVLINK_COLOR,
                 dir="both",
+                constraint="false",
             )
 
     # Network node for NICs with speed

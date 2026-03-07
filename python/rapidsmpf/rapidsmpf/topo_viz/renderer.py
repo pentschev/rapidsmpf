@@ -278,6 +278,7 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
             # dependent tiers.
             mid_gpu = local_gpu_ids[len(local_gpu_ids) // 2] if local_gpu_ids else None
             mid_sw = local_sw_ids[len(local_sw_ids) // 2] if local_sw_ids else None
+            mid_nic = local_nic_ids[len(local_nic_ids) // 2] if local_nic_ids else None
             # GPUs -> CPU -> Switches -> NICs
             if mid_gpu and cpu_id:
                 sub.edge(mid_gpu, cpu_id, style="invis")
@@ -293,6 +294,22 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                     sub.edge(cpu_id, nic_id, style="invis")
                 elif mid_gpu:
                     sub.edge(mid_gpu, nic_id, style="invis")
+
+            # Invisible anchor at the bottom of the cluster used to pull
+            # the Network node below all clusters without affecting the
+            # horizontal centering of NICs/switches.
+            anchor_id = f"_anchor_numa{numa_node}"
+            sub.node(
+                anchor_id,
+                label="",
+                shape="point",
+                width="0",
+                height="0",
+                style="invis",
+            )
+            bottom = mid_nic or mid_sw or cpu_id or mid_gpu
+            if bottom:
+                sub.edge(bottom, anchor_id, style="invis")
 
     # PCIe edges: GPU -> Switch (or GPU -> CPU if no switch)
     for gpu in gpus:
@@ -392,7 +409,9 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 constraint="false",
             )
 
-    # Network node for NICs with speed
+    # Network node for NICs with speed.
+    # Constraining edges come from invisible anchors inside each cluster
+    # (not from NICs directly) so NIC centering is not disturbed.
     nics_with_speed = [n for n in nics if n.get("bandwidth_gbps", 0) > 0]
     if nics_with_speed:
         graph.node(
@@ -403,12 +422,28 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
             fillcolor=NETWORK_COLOR,
             fontcolor=FONT_COLOR_LIGHT,
         )
-        # Single invisible constraining edge to place Network below NICs
-        graph.edge(
-            f"nic_{nics_with_speed[0]['name']}",
-            "network",
-            style="invis",
-        )
+        for numa_node in all_numa:
+            graph.edge(
+                f"_anchor_numa{numa_node}",
+                "network",
+                style="invis",
+            )
+        # Symmetric horizontal centering: constraining invisible edges
+        # from the leftmost and rightmost GPUs pull Network toward the
+        # true graph center.  GPUs are firmly positioned by many NVLink
+        # and PCIe edges, so the additional pull is negligible for them.
+        if gpus:
+            graph.edge(
+                f"gpu_{gpus[0]['id']}",
+                "network",
+                style="invis",
+            )
+            if len(gpus) > 1:
+                graph.edge(
+                    f"gpu_{gpus[-1]['id']}",
+                    "network",
+                    style="invis",
+                )
         for nic in nics_with_speed:
             bw = nic["bandwidth_gbps"]
             speed_bits = bw * 8

@@ -273,31 +273,92 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 )
                 local_nic_ids.append(nic_id)
 
-            # Invisible edges to enforce tier ordering within cluster.
-            # Use middle elements as anchors to horizontally center
-            # dependent tiers.
-            mid_gpu = local_gpu_ids[len(local_gpu_ids) // 2] if local_gpu_ids else None
-            mid_sw = local_sw_ids[len(local_sw_ids) // 2] if local_sw_ids else None
-            mid_nic = local_nic_ids[len(local_nic_ids) // 2] if local_nic_ids else None
-            # GPUs -> CPU -> Switches -> NICs
-            if mid_gpu and cpu_id:
-                sub.edge(mid_gpu, cpu_id, style="invis")
-            for sw_id in local_sw_ids:
-                if cpu_id:
-                    sub.edge(cpu_id, sw_id, style="invis")
-                elif mid_gpu:
-                    sub.edge(mid_gpu, sw_id, style="invis")
-            for nic_id in local_nic_ids:
-                if mid_sw:
-                    sub.edge(mid_sw, nic_id, style="invis")
-                elif cpu_id:
-                    sub.edge(cpu_id, nic_id, style="invis")
-                elif mid_gpu:
-                    sub.edge(mid_gpu, nic_id, style="invis")
+            # Invisible edges to enforce tier ordering and even
+            # horizontal spacing.  Each non-GPU tier element is
+            # aligned with the GPU at a fractional position
+            # (i+1)/(N+1) of the GPU span via a high-weight
+            # invisible edge + matching ``group`` attribute.
+            first_gpu = local_gpu_ids[0] if local_gpu_ids else None
+            last_gpu = local_gpu_ids[-1] if len(local_gpu_ids) > 1 else None
+            m_gpus = len(local_gpu_ids)
 
-            # Invisible anchor at the bottom of the cluster used to pull
-            # the Network node below all clusters without affecting the
-            # horizontal centering of NICs/switches.
+            # CPU: center under full GPU span
+            if cpu_id:
+                if first_gpu:
+                    sub.edge(first_gpu, cpu_id, style="invis")
+                if last_gpu:
+                    sub.edge(last_gpu, cpu_id, style="invis")
+
+            # Switches: rank below CPU + evenly spaced
+            n_sw = len(local_sw_ids)
+            for sw_id in local_sw_ids:
+                src = cpu_id or first_gpu
+                if src:
+                    sub.edge(src, sw_id, style="invis")
+            if m_gpus > 1 and n_sw == 1:
+                if first_gpu:
+                    sub.edge(first_gpu, local_sw_ids[0], style="invis")
+                if last_gpu:
+                    sub.edge(last_gpu, local_sw_ids[0], style="invis")
+            elif m_gpus > 1 and n_sw > 1:
+                for i, sw_id in enumerate(local_sw_ids):
+                    frac = (i + 1) / (n_sw + 1)
+                    gidx = round(frac * (m_gpus - 1))
+                    grp = f"n{numa_node}_c{gidx}"
+                    sub.node(local_gpu_ids[gidx], group=grp)
+                    sub.node(sw_id, group=grp)
+                    sub.edge(
+                        local_gpu_ids[gidx],
+                        sw_id,
+                        style="invis",
+                        weight="10",
+                    )
+
+            # NICs: rank below switches + evenly spaced
+            n_nic = len(local_nic_ids)
+            if local_nic_ids:
+                if local_sw_ids:
+                    for i, nic_id in enumerate(local_nic_ids):
+                        sw_idx = min(i, n_sw - 1)
+                        sub.edge(
+                            local_sw_ids[sw_idx],
+                            nic_id,
+                            style="invis",
+                        )
+                else:
+                    src = cpu_id or first_gpu
+                    if src:
+                        for nic_id in local_nic_ids:
+                            sub.edge(src, nic_id, style="invis")
+                if m_gpus > 1 and n_nic == 1:
+                    if first_gpu:
+                        sub.edge(
+                            first_gpu,
+                            local_nic_ids[0],
+                            style="invis",
+                        )
+                    if last_gpu:
+                        sub.edge(
+                            last_gpu,
+                            local_nic_ids[0],
+                            style="invis",
+                        )
+                elif m_gpus > 1 and n_nic > 1:
+                    for i, nic_id in enumerate(local_nic_ids):
+                        frac = (i + 1) / (n_nic + 1)
+                        gidx = round(frac * (m_gpus - 1))
+                        grp = f"n{numa_node}_c{gidx}"
+                        sub.node(local_gpu_ids[gidx], group=grp)
+                        sub.node(nic_id, group=grp)
+                        sub.edge(
+                            local_gpu_ids[gidx],
+                            nic_id,
+                            style="invis",
+                            weight="10",
+                        )
+
+            # Invisible anchor at the bottom of the cluster used to
+            # pull the Network node below all NUMA clusters.
             anchor_id = f"_anchor_numa{numa_node}"
             sub.node(
                 anchor_id,
@@ -307,9 +368,15 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                 height="0",
                 style="invis",
             )
-            bottom = mid_nic or mid_sw or cpu_id or mid_gpu
-            if bottom:
-                sub.edge(bottom, anchor_id, style="invis")
+            bottom_tier = (
+                local_nic_ids
+                or local_sw_ids
+                or ([cpu_id] if cpu_id else None)
+                or local_gpu_ids
+            )
+            if bottom_tier:
+                mid_idx = len(bottom_tier) // 2
+                sub.edge(bottom_tier[mid_idx], anchor_id, style="invis")
 
     # PCIe edges: GPU -> Switch (or GPU -> CPU if no switch)
     for gpu in gpus:
@@ -338,6 +405,7 @@ def build_graph(topology: dict[str, Any], *, engine: str = "dot") -> graphviz.Di
                     style="dashed",
                     color=PCIE_COLOR,
                     fontcolor=PCIE_COLOR,
+                    constraint="false",
                 )
 
     # PCIe edges: NIC -> Switch (or NIC -> CPU if no switch)

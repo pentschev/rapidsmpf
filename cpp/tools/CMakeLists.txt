@@ -8,8 +8,15 @@
 add_executable(
   rrun
   "rrun.cpp"
-  "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/system_info.cpp>"
-  "$<$<BOOL:${RAPIDSMPF_HAVE_SLURM}>:$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/bootstrap/slurm_backend.cpp>>"
+  "rrun_utils.cpp"
+  "rrun_single_node.cpp"
+  "rrun_slurm_passthrough.cpp"
+  "$<$<BOOL:${RAPIDSMPF_HAVE_SLURM}>:${CMAKE_CURRENT_SOURCE_DIR}/rrun_slurm_hybrid.cpp>"
+  "${PROJECT_SOURCE_DIR}/src/rrun/rrun.cpp"
+  "${PROJECT_SOURCE_DIR}/src/bootstrap/socket_backend.cpp"
+  "${PROJECT_SOURCE_DIR}/src/bootstrap/utils.cpp"
+  "${PROJECT_SOURCE_DIR}/src/system_info.cpp"
+  "$<$<BOOL:${RAPIDSMPF_HAVE_SLURM}>:${PROJECT_SOURCE_DIR}/src/bootstrap/slurm_backend.cpp>"
 )
 set_target_properties(
   rrun
@@ -17,7 +24,7 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
 )
-target_include_directories(rrun PRIVATE "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>")
+target_include_directories(rrun PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_compile_options(rrun PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>")
 target_compile_definitions(
   rrun PRIVATE $<$<BOOL:${RAPIDSMPF_HAVE_NUMA}>:RAPIDSMPF_HAVE_NUMA>
@@ -41,8 +48,7 @@ install(
 )
 
 add_executable(
-  topology_discovery "topology_discovery.cpp"
-                     "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/system_info.cpp>"
+  topology_discovery "topology_discovery.cpp" "${PROJECT_SOURCE_DIR}/src/system_info.cpp"
 )
 set_target_properties(
   topology_discovery
@@ -50,9 +56,7 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
 )
-target_include_directories(
-  topology_discovery PRIVATE "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
-)
+target_include_directories(topology_discovery PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_compile_options(
   topology_discovery PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>"
 )
@@ -74,8 +78,8 @@ install(
 
 add_executable(
   check_resource_binding
-  "check_resource_binding.cpp" "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/bootstrap/utils.cpp>"
-  "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/system_info.cpp>"
+  "check_resource_binding.cpp" "${PROJECT_SOURCE_DIR}/src/rrun/rrun.cpp"
+  "${PROJECT_SOURCE_DIR}/src/bootstrap/utils.cpp" "${PROJECT_SOURCE_DIR}/src/system_info.cpp"
 )
 set_target_properties(
   check_resource_binding
@@ -83,9 +87,7 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
 )
-target_include_directories(
-  check_resource_binding PRIVATE "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
-)
+target_include_directories(check_resource_binding PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_compile_options(
   check_resource_binding PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>"
 )

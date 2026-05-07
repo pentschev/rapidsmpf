@@ -4,12 +4,18 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Literal, Self
 
+import pylibcudf as plc
+
+from rapidsmpf.memory.buffer_resource import BufferResource
 from rapidsmpf.streaming.core.message import Message
+from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 class HashScheme:
-    def __init__(self, column_indices: tuple[int, ...], modulus: int) -> None: ...
+    def __init__(self, column_indices: Sequence[int], modulus: int) -> None: ...
     @property
     def column_indices(self) -> tuple[int, ...]: ...
     @property
@@ -17,7 +23,35 @@ class HashScheme:
     def __eq__(self, other: object) -> bool: ...
     def __repr__(self) -> str: ...
 
-PartitioningSpecValue = HashScheme | None | Literal["inherit"]
+@dataclass(frozen=True, slots=True)
+class OrderKey:
+    """Sort key: column index, direction, and null ordering."""
+
+    column_index: int
+    order: plc.types.Order
+    null_order: plc.types.NullOrder
+
+class OrderScheme:
+    def __init__(
+        self,
+        keys: Sequence[OrderKey],
+        boundaries: TableChunk,
+        *,
+        strict_boundaries: bool = False,
+    ) -> None: ...
+    @property
+    def keys(self) -> tuple[OrderKey, ...]: ...
+    @property
+    def strict_boundaries(self) -> bool: ...
+    @property
+    def num_boundaries(self) -> int: ...
+    def with_keys(self, new_keys: Sequence[OrderKey]) -> OrderScheme: ...
+    def boundaries_aligned_with(
+        self, other: OrderScheme, br: BufferResource
+    ) -> bool: ...
+    def __repr__(self) -> str: ...
+
+PartitioningSpecValue = HashScheme | OrderScheme | None | Literal["inherit"]
 
 class Partitioning:
     def __init__(
@@ -40,9 +74,9 @@ class ChannelMetadata:
         partitioning: Partitioning | None = None,
         duplicated: bool = False,
     ) -> None: ...
-    @staticmethod
-    def from_message(message: Message) -> ChannelMetadata: ...
-    def into_message(self, sequence_number: int, message: Message) -> None: ...
+    @classmethod
+    def from_message(cls: type[Self], message: Message[Self]) -> ChannelMetadata: ...
+    def into_message(self, sequence_number: int, message: Message[Self]) -> None: ...
     @property
     def local_count(self) -> int: ...
     @property

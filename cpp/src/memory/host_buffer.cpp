@@ -7,6 +7,7 @@
 
 #include <cuda/memory>
 
+#include <rapidsmpf/memory/cuda_memcpy_async.hpp>
 #include <rapidsmpf/memory/host_buffer.hpp>
 #include <rapidsmpf/memory/memory_type.hpp>
 
@@ -17,7 +18,9 @@ HostBuffer::HostBuffer(
 )
     : stream_{stream}, mr_{std::move(mr)} {
     if (size > 0) {
-        auto* ptr = static_cast<std::byte*>(mr_.allocate(stream_, size));
+        auto* ptr = static_cast<std::byte*>(
+            mr_.allocate(stream_, size, alignof(::cuda::std::max_align_t))
+        );
         span_ = std::span<std::byte>{ptr, size};
     }
 }
@@ -39,7 +42,9 @@ void HostBuffer::deallocate_async() noexcept {
         if (owned_storage_) {
             owned_storage_.reset();
         } else {
-            mr_.deallocate(stream_, span_.data(), span_.size());
+            mr_.deallocate(
+                stream_, span_.data(), span_.size(), alignof(::cuda::std::max_align_t)
+            );
         }
     }
     span_ = {};
@@ -98,9 +103,7 @@ std::vector<std::uint8_t> HostBuffer::copy_to_uint8_vector() const {
     std::vector<std::uint8_t> ret(size());
     if (!empty()) {
         stream_.synchronize();
-        RAPIDSMPF_CUDA_TRY(
-            cudaMemcpyAsync(ret.data(), data(), size(), cudaMemcpyDefault, stream_)
-        );
+        RAPIDSMPF_CUDA_TRY(cuda_memcpy_async(ret.data(), data(), size(), stream_));
         stream_.synchronize();
     }
     return ret;
@@ -113,9 +116,10 @@ HostBuffer HostBuffer::from_uint8_vector(
 ) {
     HostBuffer ret(data.size(), stream, mr);
     if (!ret.empty()) {
-        RAPIDSMPF_CUDA_TRY(cudaMemcpyAsync(
-            ret.data(), data.data(), data.size(), cudaMemcpyDefault, stream
-        ));
+        RAPIDSMPF_CUDA_TRY(
+            cuda_memcpy_async(ret.data(), data.data(), data.size(), stream)
+        );
+        stream.synchronize();  // need to ensure that data outlives the async copy
     }
     return ret;
 }

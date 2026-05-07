@@ -31,7 +31,7 @@
 
 #include "utils/misc.hpp"
 #include "utils/random_data.hpp"
-#include "utils/rmm_stack.hpp"
+#include "utils/rmm_utils.hpp"
 
 class ArgumentParser {
   public:
@@ -300,7 +300,9 @@ rapidsmpf::Duration do_run(
     auto const t0_elapsed = rapidsmpf::Clock::now();
     {
         RAPIDSMPF_NVTX_SCOPED_RANGE("Shuffling", total_num_partitions);
-        RAPIDSMPF_MEMORY_PROFILE(statistics, "shuffling");
+        if (args.enable_memory_profiler) {
+            RAPIDSMPF_MEMORY_PROFILE(statistics, br->device_mr(), "shuffling");
+        }
         rapidsmpf::shuffler::Shuffler shuffler(
             comm,
             0,  // op_id
@@ -537,28 +539,24 @@ int main(int argc, char** argv) {
     // Initialize configuration options from environment variables.
     rapidsmpf::config::Options options{rapidsmpf::config::get_environment_variables()};
 
-    auto const mr_stack = set_current_rmm_stack(args.rmm_mr);
-    auto stat_enabled_mr = set_device_mem_resource_with_stats();
+    set_current_rmm_resource(args.rmm_mr);
+    rapidsmpf::RmmResourceAdaptor stat_enabled_mr = set_device_mem_resource_with_stats();
 
     std::unordered_map<rapidsmpf::MemoryType, rapidsmpf::BufferResource::MemoryAvailable>
         memory_available{};
     if (args.device_mem_limit_mb >= 0) {
         memory_available[rapidsmpf::MemoryType::DEVICE] = rapidsmpf::LimitAvailableMemory{
-            stat_enabled_mr.get(), args.device_mem_limit_mb << 20
+            stat_enabled_mr, args.device_mem_limit_mb << 20
         };
     }
 
-    // Create statistics (enabled from the start) and pass to BufferResource so that
-    // all components (Shuffler, SpillManager, etc.) share the same statistics object.
-    auto stats = args.enable_memory_profiler
-                     ? std::make_shared<rapidsmpf::Statistics>(stat_enabled_mr.get())
-                     : std::make_shared<rapidsmpf::Statistics>(/* enable = */ true);
+    auto stats = std::make_shared<rapidsmpf::Statistics>(/* enable = */ true);
 
     // We're only going to measure the last run, so disable initially.
     stats->disable();
     rapidsmpf::BufferResource br{
-        stat_enabled_mr.get(),
-        args.pinned_mem_disable ? nullptr
+        stat_enabled_mr,
+        args.pinned_mem_disable ? rapidsmpf::PinnedMemoryResource::Disabled
                                 : rapidsmpf::PinnedMemoryResource::make_if_available(),
         std::move(memory_available),
         std::chrono::milliseconds{1},
@@ -672,7 +670,7 @@ int main(int argc, char** argv) {
            << " | out_parts: " << args.num_output_partitions
            << " | nranks: " << comm->nranks();
         if (args.enable_memory_profiler) {
-            auto record = stat_enabled_mr->get_main_record();
+            auto record = stat_enabled_mr.get_main_record();
             ss << " | device memory peak: " << rapidsmpf::format_nbytes(record.peak())
                << " | device memory total: "
                << rapidsmpf::format_nbytes(
@@ -682,7 +680,14 @@ int main(int argc, char** argv) {
         }
         log->print(ss.str());
     }
-    log->print(stats->report("Statistics (of the last run):"));
+
+    if (args.enable_memory_profiler) {
+        log->print(stats->report(
+            {.mr = stat_enabled_mr, .header = "Statistics (of the last run):"}
+        ));
+    } else {
+        log->print(stats->report({.header = "Statistics (of the last run):"}));
+    }
 
 #ifdef RAPIDSMPF_HAVE_CUPTI
     // Save CUPTI monitoring results to CSV file

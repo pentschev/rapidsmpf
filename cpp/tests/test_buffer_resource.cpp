@@ -14,11 +14,11 @@
 #include <cudf_test/debug_utilities.hpp>
 #include <cudf_test/table_utilities.hpp>
 #include <rmm/mr/limiting_resource_adaptor.hpp>
-#include <rmm/mr/owning_wrapper.hpp>
 
 #include <rapidsmpf/communicator/mpi.hpp>
 #include <rapidsmpf/memory/buffer.hpp>
 #include <rapidsmpf/memory/buffer_resource.hpp>
+#include <rapidsmpf/memory/cuda_memcpy_async.hpp>
 #include <rapidsmpf/shuffler/shuffler.hpp>
 #include <rapidsmpf/utils/misc.hpp>
 
@@ -175,7 +175,7 @@ TEST(BufferResource, LimitAvailableMemory) {
     auto stream = cudf::get_default_stream();
 
     // Create a buffer resource that limit available device memory to 10 KiB.
-    LimitAvailableMemory dev_mem_available{&mr, 10_KiB};
+    LimitAvailableMemory dev_mem_available{mr, 10_KiB};
     BufferResource br{
         mr, PinnedMemoryResource::Disabled, {{MemoryType::DEVICE, dev_mem_available}}
     };
@@ -241,10 +241,55 @@ TEST(BufferResource, LimitAvailableMemory) {
     EXPECT_EQ(br.memory_reserved(MemoryType::HOST), 10_KiB);
 }
 
+class PinnedMaxPoolSizeReservationLimitTest
+    : public ::testing::TestWithParam<std::optional<std::size_t>> {};
+
+TEST_P(PinnedMaxPoolSizeReservationLimitTest, TwoReservations) {
+    if (!is_pinned_memory_resources_supported()) {
+        GTEST_SKIP() << "Pinned memory not supported on this system";
+    }
+
+    auto const max_pool_size = GetParam();
+    // if max_pool_size is not set or 0, the pool is unbounded.
+    auto const expect_second_succeeds = [&] { return max_pool_size.value_or(0) == 0; };
+
+    rmm::mr::cuda_memory_resource cuda_mr;
+    RmmResourceAdaptor mr{cuda_mr};
+
+    auto pinned_mr = PinnedMemoryResource::make_if_available(
+        get_current_numa_node(), PinnedPoolProperties{.max_pool_size = max_pool_size}
+    );
+    ASSERT_NE(pinned_mr, PinnedMemoryResource::Disabled);
+
+    BufferResource br{
+        mr, pinned_mr, {{MemoryType::PINNED_HOST, pinned_mr->get_memory_available_cb()}}
+    };
+
+    // First 1 KiB reservation always succeeds.
+    auto [r1, ob1] = br.reserve(MemoryType::PINNED_HOST, 1_KiB, AllowOverbooking::NO);
+    EXPECT_EQ(r1.size(), 1_KiB);
+    EXPECT_EQ(ob1, 0);
+
+    // Second 1 KiB reservation succeeds only when the pool is unbounded.
+    auto [r2, ob2] = br.reserve(MemoryType::PINNED_HOST, 1_KiB, AllowOverbooking::NO);
+    EXPECT_EQ(r2.size(), expect_second_succeeds() ? 1_KiB : 0);
+    EXPECT_EQ(ob2, expect_second_succeeds() ? 0 : 1_KiB);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    PinnedMaxPoolSize,
+    PinnedMaxPoolSizeReservationLimitTest,
+    ::testing::Values(
+        std::optional<std::size_t>{std::nullopt},
+        std::optional<std::size_t>{0},
+        std::optional<std::size_t>{1_KiB}
+    )
+);
+
 TEST(BufferResource, AllocStatistics) {
     rmm::mr::cuda_memory_resource mr_cuda;
     RmmResourceAdaptor mr{mr_cuda};
-    auto stats = std::make_shared<Statistics>(&mr);
+    auto stats = std::make_shared<Statistics>(/* enable = */ true);
     auto pinned_mr = PinnedMemoryResource::make_if_available();
     BufferResource br{
         mr,
@@ -311,18 +356,16 @@ class BufferResourceReserveOrFailTest : public ::testing::Test {
     void SetUp() override {
         // Create a buffer resource with limited device memory (10 KiB) and unlimited
         // host memory.
-        cuda_mr = std::make_unique<rmm::mr::cuda_memory_resource>();
-        mr = std::make_unique<RmmResourceAdaptor>(*cuda_mr);
+        mr = std::make_unique<RmmResourceAdaptor>(rmm::mr::cuda_memory_resource{});
         br = std::make_unique<BufferResource>(
             *mr,
             PinnedMemoryResource::Disabled,
             std::unordered_map<MemoryType, BufferResource::MemoryAvailable>{
-                {MemoryType::DEVICE, LimitAvailableMemory{mr.get(), 10_KiB}}
+                {MemoryType::DEVICE, LimitAvailableMemory{*mr, 10_KiB}}
             }
         );
     }
 
-    std::unique_ptr<rmm::mr::cuda_memory_resource> cuda_mr;
     std::unique_ptr<RmmResourceAdaptor> mr;
     std::unique_ptr<BufferResource> br;
 };
@@ -398,9 +441,9 @@ class BaseBufferResourceCopyTest : public ::testing::Test {
         EXPECT_EQ(buf->mem_type(), mem_type);
         // copy the host pattern to the Buffer
         buf->write_access([&](std::byte* buf_data, rmm::cuda_stream_view stream) {
-            RAPIDSMPF_CUDA_TRY(cudaMemcpyAsync(
-                buf_data, host_pattern.data(), size, cudaMemcpyDefault, stream
-            ));
+            RAPIDSMPF_CUDA_TRY(
+                cuda_memcpy_async(buf_data, host_pattern.data(), size, stream)
+            );
         });
         return buf;
     }
@@ -445,9 +488,9 @@ class BufferResourceCopySliceTest
         EXPECT_TRUE(slice->is_latest_write_done());
 
         std::vector<std::uint8_t> verify_data(length);
-        RAPIDSMPF_CUDA_TRY(cudaMemcpyAsync(
-            verify_data.data(), slice->data(), length, cudaMemcpyDefault, stream
-        ));
+        RAPIDSMPF_CUDA_TRY(
+            cuda_memcpy_async(verify_data.data(), slice->data(), length, stream)
+        );
         stream.synchronize();
         verify_slice(verify_data, offset, length);
         return slice;
@@ -525,12 +568,8 @@ class BufferResourceCopyToTest : public BaseBufferResourceCopyTest,
         EXPECT_TRUE(dest->is_latest_write_done());
 
         std::vector<std::uint8_t> verify_data_buf(length);
-        RAPIDSMPF_CUDA_TRY(cudaMemcpyAsync(
-            verify_data_buf.data(),
-            dest->data() + dest_offset,
-            length,
-            cudaMemcpyDefault,
-            stream
+        RAPIDSMPF_CUDA_TRY(cuda_memcpy_async(
+            verify_data_buf.data(), dest->data() + dest_offset, length, stream
         ));
         stream.synchronize();
         verify_slice(verify_data_buf, 0, length);
@@ -604,14 +643,12 @@ class BufferResourceDifferentResourcesTest : public ::testing::Test {
         }
 
         // Setup br1 with statistics for its device memory
-        mr_cuda1 = std::make_unique<rmm::mr::cuda_memory_resource>();
-        mr1 = std::make_unique<RmmResourceAdaptor>(*mr_cuda1);
-        br1 = std::make_unique<BufferResource>(mr1.get());
+        mr1 = std::make_unique<RmmResourceAdaptor>(rmm::mr::cuda_memory_resource{});
+        br1 = std::make_unique<BufferResource>(*mr1);
 
         // Setup br2 with statistics for its device memory
-        mr_cuda2 = std::make_unique<rmm::mr::cuda_memory_resource>();
-        mr2 = std::make_unique<RmmResourceAdaptor>(*mr_cuda2);
-        br2 = std::make_unique<BufferResource>(mr2.get());
+        mr2 = std::make_unique<RmmResourceAdaptor>(rmm::mr::cuda_memory_resource{});
+        br2 = std::make_unique<BufferResource>(*mr2);
     }
 
     std::unique_ptr<Buffer> create_source_buffer() {
@@ -623,13 +660,9 @@ class BufferResourceDifferentResourcesTest : public ::testing::Test {
         EXPECT_EQ(buf1->mem_type(), MemoryType::DEVICE);
 
         buf1->write_access([&](std::byte* buf1_data, rmm::cuda_stream_view stream) {
-            RAPIDSMPF_CUDA_TRY(cudaMemcpyAsync(
-                buf1_data,
-                host_pattern.data(),
-                buffer_size,
-                cudaMemcpyHostToDevice,
-                stream
-            ));
+            RAPIDSMPF_CUDA_TRY(
+                cuda_memcpy_async(buf1_data, host_pattern.data(), buffer_size, stream)
+            );
         });
         buf1->stream().synchronize();
         EXPECT_EQ(mr1->get_main_record().total(), buffer_size);
@@ -647,8 +680,6 @@ class BufferResourceDifferentResourcesTest : public ::testing::Test {
     rmm::cuda_stream_view stream;
     std::vector<std::uint8_t> host_pattern;
 
-    std::unique_ptr<rmm::mr::cuda_memory_resource> mr_cuda1;
-    std::unique_ptr<rmm::mr::cuda_memory_resource> mr_cuda2;
     std::unique_ptr<RmmResourceAdaptor> mr1;
     std::unique_ptr<RmmResourceAdaptor> mr2;
     std::unique_ptr<BufferResource> br1;
@@ -750,9 +781,7 @@ TEST_F(BufferCopyEdgeCases, ZeroSizeIsNoOp) {
     // Pre-fill dst with a sentinel pattern
     std::vector<std::uint8_t> sent(N, 0xCD);
     dst->write_access([&](std::byte* dst_data, rmm::cuda_stream_view stream) {
-        RAPIDSMPF_CUDA_TRY(
-            cudaMemcpyAsync(dst_data, sent.data(), N, cudaMemcpyDefault, stream)
-        );
+        RAPIDSMPF_CUDA_TRY(cuda_memcpy_async(dst_data, sent.data(), N, stream));
     });
     EXPECT_NO_THROW(buffer_copy(br->statistics(), *dst, *src, 0, 0, 0));
     dst->stream().synchronize();

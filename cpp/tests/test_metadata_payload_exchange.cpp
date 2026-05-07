@@ -1,5 +1,5 @@
 /**
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -7,13 +7,13 @@
 #include <gtest/gtest.h>
 
 #include <rmm/mr/cuda_memory_resource.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <rapidsmpf/communicator/metadata_payload_exchange/core.hpp>
 #include <rapidsmpf/communicator/metadata_payload_exchange/tag.hpp>
 #include <rapidsmpf/memory/buffer.hpp>
 #include <rapidsmpf/memory/buffer_resource.hpp>
+#include <rapidsmpf/memory/cuda_memcpy_async.hpp>
 #include <rapidsmpf/statistics.hpp>
 
 #include "environment.hpp"
@@ -26,10 +26,8 @@ class MetadataPayloadExchangeTest : public ::testing::Test {
   protected:
     void SetUp() override {
         comm = GlobalEnvironment->comm_.get();
-        mr = std::unique_ptr<rmm::mr::device_memory_resource>(
-            new rmm::mr::cuda_memory_resource{}
-        );
-        br = std::make_unique<BufferResource>(mr.get());
+        mr = std::make_unique<rmm::mr::cuda_memory_resource>();
+        br = std::make_unique<BufferResource>(*mr);
         stream = rmm::cuda_stream_default;
         statistics = std::make_shared<Statistics>();
 
@@ -60,9 +58,9 @@ class MetadataPayloadExchangeTest : public ::testing::Test {
                 [data_size](std::byte* ptr, rmm::cuda_stream_view stream) {
                     std::vector<std::uint8_t> test_data(data_size);
                     std::iota(test_data.begin(), test_data.end(), 0);
-                    RAPIDSMPF_CUDA_TRY(cudaMemcpyAsync(
-                        ptr, test_data.data(), data_size, cudaMemcpyHostToDevice, stream
-                    ));
+                    RAPIDSMPF_CUDA_TRY(
+                        cuda_memcpy_async(ptr, test_data.data(), data_size, stream)
+                    );
                 }
             );
             data_buffer->stream().synchronize();
@@ -89,13 +87,9 @@ class MetadataPayloadExchangeTest : public ::testing::Test {
         EXPECT_EQ(buffer->size, expected_size);
 
         std::vector<std::uint8_t> received_data(expected_size);
-        RAPIDSMPF_CUDA_TRY(cudaMemcpyAsync(
-            received_data.data(),
-            buffer->data(),
-            expected_size,
-            cudaMemcpyDeviceToHost,
-            stream
-        ));
+        RAPIDSMPF_CUDA_TRY(
+            cuda_memcpy_async(received_data.data(), buffer->data(), expected_size, stream)
+        );
         stream.synchronize();
 
         for (std::size_t i = 0; i < expected_size; ++i) {
@@ -104,7 +98,7 @@ class MetadataPayloadExchangeTest : public ::testing::Test {
     }
 
     Communicator* comm;
-    std::unique_ptr<rmm::mr::device_memory_resource> mr;
+    std::unique_ptr<rmm::mr::cuda_memory_resource> mr;
     rmm::cuda_stream_view stream;
     std::unique_ptr<BufferResource> br;
     std::shared_ptr<Statistics> statistics;

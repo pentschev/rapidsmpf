@@ -6,17 +6,23 @@
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
-#include <functional>
+#include <initializer_list>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <ostream>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <rapidsmpf/config.hpp>
 #include <rapidsmpf/memory/memory_type.hpp>
+#include <rapidsmpf/memory/pinned_memory_resource.hpp>
+#include <rapidsmpf/memory/resource_types.hpp>
 #include <rapidsmpf/rmm_resource_adaptor.hpp>
 #include <rapidsmpf/utils/misc.hpp>
 
@@ -31,29 +37,33 @@ class StreamOrderedTiming;
  *
  * - **Stat name**: identifies an individual `Stat` accumulator, as passed to
  *   `add_stat()`, `get_stat()`, `add_bytes_stat()`, and `add_duration_stat()`.
- *   Stats can be accumulated and retrieved without registering a formatter.
+ *   Stats are pure numeric accumulators with no associated rendering
+ *   information.
  *   Examples: `"spill-time"`, `"spill-bytes"`.
  *
- * - **Report entry name**: the label of a formatted line in `report()`, passed
- *   to `register_formatter()`. An entry may aggregate one or more stats. For
- *   the single-stat overload of `register_formatter()`, the report entry name
- *   and stat name are identical.
+ * - **Report entry name**: the label of a formatted line in `report()`,
+ *   passed to `add_report_entry()`. An entry names one or more stats and
+ *   a `Formatter` that selects how those stats are rendered. When the
+ *   entry covers a single stat, the report entry name and stat name are
+ *   typically identical.
  *   Example: `"spill"` (aggregating `"spill-bytes"` and `"spill-time"`).
+ *
+ * Formatters are a fixed, predefined set (see `Statistics::Formatter`).
  *
  * @code{.cpp}
  * Statistics stats;
  *
- * // Register a multi-stat formatter under a single report entry name.
- * stats.register_formatter(
- *     "spill",                              // report entry name
- *     {"spill-bytes", "spill-time"},        // stat names
- *     [](std::ostream& os, auto const& s) {
- *         os << format_nbytes(s[0].value()) << " in " << format_duration(s[1].value());
- *     }
+ * // Associate two stats with a predefined multi-stat formatter.
+ * stats.add_report_entry(
+ *     "copy-device-to-host",                // report entry name
+ *     {"copy-device-to-host-bytes",
+ *      "copy-device-to-host-time",
+ *      "copy-device-to-host-stream-delay"},
+ *     Statistics::Formatter::MemoryThroughput
  * );
  *
- * stats.add_bytes_stat("spill-bytes", 1024);
- * stats.add_duration_stat("spill-time", 0.5);
+ * stats.add_bytes_stat("spill-bytes", 1024);    // helper: registers Bytes entry
+ * stats.add_duration_stat("spill-time", 0.5s);  // helper: registers Duration entry
  *
  * auto s = stats.get_stat("spill-bytes");  // retrieve without formatter
  * std::cout << stats.report();
@@ -61,6 +71,41 @@ class StreamOrderedTiming;
  */
 class Statistics {
   public:
+    /**
+     * @brief Identifies a predefined formatter used by `report()`.
+     *
+     * Each formatter consumes a fixed number of `Stat` entries and renders them
+     * into a human-readable string.
+     *
+     * Available formatters (examples):
+     *
+     * - Default (1 stat):
+     *   "123"
+     *
+     * - Bytes (1 stat):
+     *   "1.2 GiB | avg 300 MiB"
+     *
+     * - Duration (1 stat):
+     *   "2.5 ms | avg 600 us"
+     *
+     * - HitRate (1 stat):
+     *   "42/100 (hits/lookups)"
+     *
+     * - MemoryThroughput (3 stats: bytes, time, stream-delay), where `stream-delay` is
+     *   the wall-clock gap between CPU submission and GPU execution of the operation:
+     *   "1.2 GiB | 2.5 ms | 480 GiB/s | avg-stream-delay 10 us"
+     *
+     * `_Count` is an internal sentinel — always keep it last.
+     */
+    enum class Formatter : std::uint8_t {
+        Default = 0,
+        Bytes,
+        Duration,
+        HitRate,
+        MemoryThroughput,
+        _Count,  ///< Sentinel; must remain last.
+    };
+
     /**
      * @brief Constructs a Statistics object without memory profiling.
      *
@@ -70,33 +115,22 @@ class Statistics {
     Statistics(bool enabled = true);
 
     /**
-     * @brief Constructs a Statistics object with memory profiling enabled.
-     *
-     * Automatically enables both statistics and memory profiling.
-     *
-     * @param mr Pointer to a memory resource used for memory profiling. Must remain valid
-     * for the lifetime of the returned object.
-     *
-     * @throws std::invalid_argument If `mr` is the nullptr.
-     */
-    Statistics(RmmResourceAdaptor* mr);
-
-    /**
      * @brief Construct from configuration options.
      *
-     * @param mr Pointer to a memory resource used for memory profiling. Must remain valid
-     * for the lifetime of the returned object.
      * @param options Configuration options.
      *
      * @return A shared pointer to the constructed Statistics instance.
      */
-    static std::shared_ptr<Statistics> from_options(
-        RmmResourceAdaptor* mr, config::Options options
-    );
+    static std::shared_ptr<Statistics> from_options(config::Options options);
 
     ~Statistics() noexcept;
+
+    // `Statistics` is owned exclusively through `std::shared_ptr` (see `disabled()` and
+    // `from_options()`).
     Statistics(Statistics const&) = delete;
     Statistics& operator=(Statistics const&) = delete;
+    Statistics(Statistics&&) = delete;
+    Statistics& operator=(Statistics&&) = delete;
 
     /**
      * @brief Returns a shared pointer to a disabled (no-op) Statistics instance.
@@ -107,29 +141,6 @@ class Statistics {
      * @return A shared pointer to a Statistics instance with tracking disabled.
      */
     static std::shared_ptr<Statistics> disabled();
-
-    /**
-     * @brief Move constructor.
-     *
-     * @param o The Statistics object to move from.
-     */
-    Statistics(Statistics&& o) noexcept
-        : enabled_(o.enabled()),
-          stats_{std::move(o.stats_)},
-          formatters_{std::move(o.formatters_)} {}
-
-    /**
-     * @brief Move assignment operator.
-     *
-     * @param o The Statistics object to move from.
-     * @return Reference to this updated instance.
-     */
-    Statistics& operator=(Statistics&& o) noexcept {
-        enabled_ = o.enabled();
-        stats_ = std::move(o.stats_);
-        formatters_ = std::move(o.formatters_);
-        return *this;
-    }
 
     /**
      * @brief Checks if statistics tracking is enabled.
@@ -155,35 +166,65 @@ class Statistics {
     }
 
     /**
+     * @brief Named-argument struct for `report()`.
+     *
+     * All fields carry defaults so any subset may be supplied using designated
+     * initialisers:
+     * @code{.cpp}
+     * stats.report({.mr = my_mr, .header = "Run 1:"});
+     * @endcode
+     */
+    struct ReportArgs {
+        /// Optional RMM resource adaptor used for memory profiling. When provided,
+        /// a memory profiling section is included in the report. When `std::nullopt`,
+        /// the memory profiling section shows "Disabled".
+        std::optional<any_device_resource> mr = std::nullopt;
+        /// Optional pinned memory resource. When provided, a pinned memory section
+        /// is included in the report.
+        std::optional<any_host_device_resource> pinned_mr = std::nullopt;
+        /// Header line prepended to the report.
+        std::string_view header = "Statistics:";
+    };
+
+    /**
      * @brief Generates a formatted report of all collected statistics.
      *
-     * Every registered formatter always produces an entry. If all its required
-     * statistics have been recorded the formatter renders the values; otherwise the
-     * entry reads "No data collected". Statistics not covered by any formatter are
-     * shown as plain numeric values. All entries are sorted alphabetically.
+     * Every registered report entry always produces a line. If all the stats
+     * it references have been recorded, the entry's `Formatter` renders
+     * the values; otherwise the line reads "No data collected". Statistics
+     * not covered by any report entry are shown with `Formatter::Default`
+     * (raw numeric value, optionally annotated with the count). All entries
+     * are sorted alphabetically.
      *
      * @note If any statistics are collected via stream-ordered timing (e.g. through
      * `record_copy()`), all relevant CUDA streams must be synchronized before calling
      * this method. Otherwise, some timing statistics may not yet have been recorded,
      * causing entries to read "No data collected" or imprecise statistics.
      *
-     * @param header Header line prepended to the report.
+     * @param report_args Report options. See `ReportArgs`.
      * @return Formatted statistics report.
      */
-    std::string report(std::string const& header = "Statistics:") const;
+    std::string report(ReportArgs report_args) const;
+
+    /**
+     * @brief Overload with all-default options. Equivalent to `report(ReportArgs{})`.
+     * @return Formatted statistics report.
+     */
+    std::string report() const {
+        return report(ReportArgs{});
+    }
 
     /**
      * @brief Writes a JSON representation of all collected statistics to a stream.
      *
-     * Values are written as raw numbers (count, sum, max). Registered formatters,
-     * which produce human-readable strings such as "1.0 KiB" or "3.5 ms" in the
-     * text report, are not applied so that the output remains machine-parseable
-     * with consistent numeric types.
+     * Values are written as raw numbers (count, sum, max). Formatter
+     * metadata is not emitted — use `report()` for the human-readable
+     * rendering.
      *
      * @param os Output stream to write to.
-     * @throws std::invalid_argument If any stat name or memory record name contains
-     * characters that require JSON escaping (double quotes, backslashes, or ASCII
-     * control characters 0x00–0x1F).
+     * @throws std::invalid_argument If any stat name or memory record name
+     * contains characters that require JSON escaping (double quotes,
+     * backslashes, or ASCII control characters 0x00–0x1F).
      */
     void write_json(std::ostream& os) const;
 
@@ -196,7 +237,66 @@ class Statistics {
     void write_json(std::filesystem::path const& filepath) const;
 
     /**
+     * @brief Creates a deep copy of this Statistics object.
+     *
+     * @note Memory records are not copied.
+     *
+     * @return A shared pointer to the new copy.
+     */
+    [[nodiscard]] std::shared_ptr<Statistics> copy() const;
+
+    /**
+     * @brief Serializes the stats and report entries to a binary byte vector.
+     *
+     * @note Memory records are not serialized.
+     *
+     * @return A vector of bytes containing the serialized statistics.
+     */
+    [[nodiscard]] std::vector<std::uint8_t> serialize() const;
+
+    /**
+     * @brief Deserializes a Statistics object from a binary byte vector.
+     *
+     * @note The resulting object has no memory records.
+     *
+     * @param data The serialized statistics data.
+     * @return A shared pointer to the reconstructed Statistics object.
+     * @throws std::invalid_argument If the data is malformed or truncated.
+     */
+    [[nodiscard]] static std::shared_ptr<Statistics> deserialize(
+        std::span<std::uint8_t const> data
+    );
+
+    /**
+     * @brief Merge a set of Statistics into a new instance.
+     *
+     * For each stat name present across the inputs, the result contains the
+     * summed count, summed value, and the maximum of the recorded maxima.
+     * The result's `enabled()` is true if any input is enabled. Memory
+     * records are not merged.
+     *
+     * Report entries are unified by name. If multiple inputs contain the
+     * same report-entry name, their `Formatter` and `stat_names` must match;
+     * otherwise, this function throws `std::invalid_argument` to prevent
+     * silent rendering inconsistencies (especially across
+     * serialize/deserialize boundaries).
+     *
+     * @param stats Non-empty span of non-null `Statistics` instances to merge.
+     * @return A new `Statistics` instance containing the merged data.
+     *
+     * @throws std::invalid_argument If @p stats is empty, contains a null
+     * pointer, or if inputs disagree on the formatter or stat-name set for
+     * a shared report entry.
+     */
+    [[nodiscard]] static std::shared_ptr<Statistics> merge(
+        std::span<std::shared_ptr<Statistics> const> stats
+    );
+
+    /**
      * @brief Represents a single tracked statistic.
+     *
+     * @note Stat is not thread-safe. Thread safety is provided by the enclosing
+     * Statistics object's mutex.
      */
     class Stat {
       public:
@@ -204,6 +304,15 @@ class Statistics {
          * @brief Default-constructs a Stat.
          */
         Stat() = default;
+
+        /**
+         * @brief Constructs a Stat with explicit field values.
+         *
+         * @param count Number of updates.
+         * @param value Total accumulated value.
+         * @param max Maximum value seen.
+         */
+        Stat(std::size_t count, double value, double max);
 
         /**
          * @brief Three-way comparison operator.
@@ -219,29 +328,21 @@ class Statistics {
          *
          * @param value The value to add.
          */
-        void add(double value) {
-            ++count_;
-            value_ += value;
-            max_ = std::max(max_, value);
-        }
+        void add(double value);
 
         /**
          * @brief Returns the number of updates applied to this statistic.
          *
          * @return The number of times `add()` was called.
          */
-        [[nodiscard]] std::size_t count() const noexcept {
-            return count_;
-        }
+        [[nodiscard]] std::size_t count() const noexcept;
 
         /**
          * @brief Returns the total accumulated value.
          *
          * @return The sum of all values added.
          */
-        [[nodiscard]] double value() const noexcept {
-            return value_;
-        }
+        [[nodiscard]] double value() const noexcept;
 
         /**
          * @brief Returns the maximum value seen across all `add()` calls.
@@ -249,22 +350,57 @@ class Statistics {
          * @return The maximum value added, or negative infinity if `add()` was never
          * called.
          */
-        [[nodiscard]] double max() const noexcept {
-            return max_;
+        [[nodiscard]] double max() const noexcept;
+
+        /**
+         * @brief Returns the serialized size of this Stat in bytes.
+         *
+         * We size each field individually rather than using `sizeof(Stat)` to
+         * avoid platform-dependent struct padding.
+         *
+         * @return The number of bytes needed to serialize this Stat.
+         */
+        [[nodiscard]] static constexpr std::size_t serialized_size() noexcept {
+            return sizeof(std::uint64_t) + sizeof(double) + sizeof(double);
         }
+
+        /**
+         * @brief Serializes this Stat to a byte buffer.
+         *
+         * @param out Pointer to the output buffer. Must have at least
+         * `serialized_size()` bytes available.
+         * @return Pointer past the last byte written.
+         */
+        std::uint8_t* serialize(std::uint8_t* out) const;
+
+        /**
+         * @brief Deserializes a Stat from a byte buffer.
+         *
+         * @param data The input buffer. Must contain at least `serialized_size()`
+         * bytes.
+         * @return A pair of the deserialized Stat and the remaining unconsumed
+         * bytes.
+         * @throws std::invalid_argument If the data is truncated.
+         */
+        [[nodiscard]] static std::pair<Stat, std::span<std::uint8_t const>> deserialize(
+            std::span<std::uint8_t const> data
+        );
+
+        /**
+         * @brief Merges another Stat into this one, returning the combined result.
+         *
+         * Counts and values are summed; the maximum is taken.
+         *
+         * @param other The Stat to merge with.
+         * @return A new Stat containing the merged result.
+         */
+        [[nodiscard]] Stat merge(Stat const& other) const;
 
       private:
         std::size_t count_{0};
         double value_{0};
         double max_{-std::numeric_limits<double>::infinity()};
     };
-
-    /**
-     * @brief Type alias for a statistics formatting function.
-     *
-     * The formatter receives all the named stats it declared interest in as a vector.
-     */
-    using Formatter = std::function<void(std::ostream&, std::vector<Stat> const&)>;
 
     /**
      * @brief Retrieves a statistic by name.
@@ -277,7 +413,9 @@ class Statistics {
     /**
      * @brief Adds a numeric value to the named statistic.
      *
-     * Creates the statistic if it doesn't exist.
+     * Creates the statistic if it doesn't exist. Does not associate any
+     * formatter with the stat — use `add_report_entry()` (or a helper like
+     * `add_bytes_stat()`) for that.
      *
      * @param name Name of the statistic.
      * @param value Value to add.
@@ -285,57 +423,46 @@ class Statistics {
     void add_stat(std::string const& name, double value);
 
     /**
-     * @brief Check whether a report entry name already has a formatter registered.
+     * @brief Associate a formatter with one or more named statistics for
+     * report rendering.
      *
-     * Intended as a cheap pre-check before constructing arguments to
-     * `register_formatter()`.
-     *
-     * @note The result may be outdated by the time it is acted upon. This method
-     * should only be used as an optimization hint to avoid unnecessary work, never
-     * for correctness decisions. Once this method returns `true` for a given name it
-     * will never return `false` again, because formatters cannot be unregistered.
-     *
-     * @param name Report entry name to look up.
-     * @return True if a formatter is registered under @p name, otherwise false.
-     */
-    bool exist_report_entry_name(std::string const& name) const;
-
-    /**
-     * @brief Register a formatter for a single named statistic.
-     *
-     * If a formatter is already registered under @p name, this call has no effect.
-     * The formatter is only invoked during `report()` if the named statistic has
-     * been recorded.
-     *
-     * @param name Report entry name (also used as the stat name to collect).
-     * @param formatter Function used to format this statistic when reporting.
-     */
-    void register_formatter(std::string const& name, Formatter formatter);
-
-    /**
-     * @brief Register a formatter that takes multiple named statistics.
-     *
-     * If a formatter is already registered under @p report_entry_name, this call has
-     * no effect. The formatter is invoked during `report()` only if all stats in
-     * @p stat_names have been recorded; if any are missing the entry reads
-     * "No data collected".
+     * First-wins: if a report entry is already registered under
+     * @p report_entry_name, this call has no effect. The entry appears in
+     * `report()` as a single line; if any stat it references is missing,
+     * the line reads "No data collected".
      *
      * @param report_entry_name Report entry name.
-     * @param stat_names Names of the stats to collect and pass to the formatter.
-     * @param formatter Function called with all collected stats during reporting.
+     * @param stat_names Names of the stats this entry aggregates. Caller is
+     * responsible for passing the number of stats the chosen @p formatter
+     * expects; a mismatch surfaces as `std::out_of_range` when `report()`
+     * renders the entry.
+     * @param formatter Predefined formatter to render the entry with.
      */
-    void register_formatter(
+    void add_report_entry(
         std::string const& report_entry_name,
-        std::vector<std::string> const& stat_names,
+        std::initializer_list<std::string_view> stat_names,
+        Formatter formatter
+    );
+
+    // clang-format off
+    /**
+     * @copydoc add_report_entry(std::string const&,std::initializer_list<std::string_view>, Formatter)
+     *
+     * Overload for callers whose stat names come from a runtime container (e.g. the Python bindings).
+     */
+    // clang-format on
+    void add_report_entry(
+        std::string const& report_entry_name,
+        std::vector<std::string> stat_names,
         Formatter formatter
     );
 
     /**
      * @brief Adds a byte count to the named statistic.
      *
-     * Registers a formatter that formats values as human-readable byte sizes if no
-     * formatter is already registered for @p name, then adds @p nbytes to the
-     * named statistic.
+     * Registers a `Formatter::Bytes` report entry named @p name if no
+     * report entry already exists under that name, then adds @p nbytes to
+     * the named statistic.
      *
      * @param name Name of the statistic.
      * @param nbytes Number of bytes to add.
@@ -345,9 +472,9 @@ class Statistics {
     /**
      * @brief Adds a duration to the named statistic.
      *
-     * Registers a formatter that formats values as time durations in seconds if no
-     * formatter is already registered for @p name, then adds @p seconds to the
-     * named statistic.
+     * Registers a `Formatter::Duration` report entry named @p name if no
+     * report entry already exists under that name, then adds @p seconds to
+     * the named statistic.
      *
      * @param name Name of the statistic.
      * @param seconds Duration in seconds to add.
@@ -409,16 +536,11 @@ class Statistics {
     /**
      * @brief Clears all statistics.
      *
-     * @note Memory profiling records and registered formatters are not cleared.
+     * @note Memory profiling records and report entries are not cleared.
      */
     void clear();
 
-    /**
-     * @brief Checks whether memory profiling is enabled.
-     *
-     * @return True if memory profiling is active, otherwise False.
-     */
-    bool is_memory_profiling_enabled() const;
+    // TODO: move MemoryRecord and MemoryRecorder to RmmResourceAdaptor?
 
     /**
      * @brief Holds memory profiling information for a named scope.
@@ -445,10 +567,10 @@ class Statistics {
          * @brief Constructs an active MemoryRecorder.
          *
          * @param stats Pointer to Statistics object that will store the result.
-         * @param mr Memory resource that provides the scoped memory statistics.
+         * @param mr The RMM resource adaptor providing scoped memory statistics.
          * @param name Name of the scope.
          */
-        MemoryRecorder(Statistics* stats, RmmResourceAdaptor* mr, std::string name);
+        MemoryRecorder(Statistics* stats, RmmResourceAdaptor mr, std::string name);
 
         /**
          * @brief Destructor.
@@ -464,21 +586,27 @@ class Statistics {
         MemoryRecorder& operator=(MemoryRecorder&&) = delete;
 
       private:
-        Statistics* stats_{nullptr};
-        RmmResourceAdaptor* mr_{nullptr};
+        Statistics* stats_{
+            nullptr
+        };  // TODO: make this shared_ptr using make_shared_from_this
+        std::optional<RmmResourceAdaptor>
+            mr_;  // optional because RmmResourceAdaptor is not default constructible
         std::string name_;
-        ScopedMemoryRecord main_record_;
     };
 
     /**
      * @brief Creates a scoped memory recorder for the given name.
      *
-     * If memory profiling is not enabled, returns a no-op recorder.
+     * When @p mr is `std::nullopt`, returns a no-op recorder.
      *
+     * @param mr Optional RMM resource adaptor for tracking allocations. Pass
+     * `std::nullopt` to get a no-op recorder.
      * @param name Name of the scope.
      * @return A MemoryRecorder instance.
      */
-    MemoryRecorder create_memory_recorder(std::string name);
+    MemoryRecorder create_memory_recorder(
+        std::optional<any_device_resource> mr, std::string name
+    );
 
     /**
      * @brief Retrieves all memory profiling records stored by this instance.
@@ -489,68 +617,70 @@ class Statistics {
 
   private:
     /**
-     * @brief Associates a display name with a formatter and the stats it aggregates.
+     * @brief A report entry describing which stats to aggregate and how to render them.
      */
-    struct FormatterEntry {
-        std::vector<std::string> stat_names;  ///< Stats to collect and pass to fn.
-        Formatter fn;
+    struct ReportEntry {
+        std::vector<std::string> stat_names;
+        Formatter formatter;
     };
 
     mutable std::mutex mutex_;
     std::atomic<bool> enabled_;
     std::map<std::string, Stat> stats_;
-    std::map<std::string, FormatterEntry> formatters_;
+    std::map<std::string, ReportEntry> report_entries_;
     std::unordered_map<std::string, MemoryRecord> memory_records_;
-    RmmResourceAdaptor* mr_;
 };
 
 /**
  * @brief Macro for automatic memory profiling of a code scope.
  *
  * This macro creates a scoped memory recorder that records memory usage statistics
- * upon entering and leaving a code block (if memory profiling is enabled).
+ * upon entering and leaving a code block.
  *
  * Usage:
- * - `RAPIDSMPF_MEMORY_PROFILE(stats)` - Uses __func__ as the function name
- * - `RAPIDSMPF_MEMORY_PROFILE(stats, "custom_name")` - Uses custom_name as the function
- * name
+ * - `RAPIDSMPF_MEMORY_PROFILE(stats, mr)` - Uses __func__ as the function name
+ * - `RAPIDSMPF_MEMORY_PROFILE(stats, mr, "custom_name")` - Uses custom_name as the
+ * function name
  *
  * Example usage:
  * @code
- * void foo(Statistics& stats) {
- *     RAPIDSMPF_MEMORY_PROFILE(stats);
- *     RAPIDSMPF_MEMORY_PROFILE(stats, "custom_name");
+ * void foo(Statistics& stats, RmmResourceAdaptor& mr) {
+ *     RAPIDSMPF_MEMORY_PROFILE(stats, mr);
+ *     RAPIDSMPF_MEMORY_PROFILE(stats, mr, "custom_name");
  * }
  * @endcode
  *
  * The first argument is a reference or pointer to a Statistics object.
- * The second argument (optional) is a custom function name string to use instead of
+ * The second argument is the RMM resource adaptor (or `std::nullopt` for no-op).
+ * The third argument (optional) is a custom function name string to use instead of
  * __func__.
  */
-#define RAPIDSMPF_MEMORY_PROFILE(...)                                       \
-    RAPIDSMPF_OVERLOAD_BY_ARG_COUNT(                                        \
-        __VA_ARGS__, RAPIDSMPF_MEMORY_PROFILE_2, RAPIDSMPF_MEMORY_PROFILE_1 \
-    )                                                                       \
-    (__VA_ARGS__)
+// clang-format off
+// Picks between _2 (stats, mr) and _3 (stats, mr, funcname) forms.
+#define RAPIDSMPF_MEMORY_PROFILE_PICK_(_1, _2, _3, NAME, ...) NAME
+#define RAPIDSMPF_MEMORY_PROFILE(...)                                                     \
+    RAPIDSMPF_MEMORY_PROFILE_PICK_(                                                       \
+        __VA_ARGS__, RAPIDSMPF_MEMORY_PROFILE_3, RAPIDSMPF_MEMORY_PROFILE_2, ~            \
+    )(__VA_ARGS__)
+// clang-format on
 
 // Version with default function name (__func__)
-#define RAPIDSMPF_MEMORY_PROFILE_1(stats) RAPIDSMPF_MEMORY_PROFILE_2(stats, __func__)
+#define RAPIDSMPF_MEMORY_PROFILE_2(stats, mr) \
+    RAPIDSMPF_MEMORY_PROFILE_3(stats, mr, __func__)
 
 // Version with custom function name
-#define RAPIDSMPF_MEMORY_PROFILE_2(stats, funcname)                                      \
-    auto&& RAPIDSMPF_CONCAT(_rapidsmpf_stats_, __LINE__) = (stats);                      \
-    auto const RAPIDSMPF_CONCAT(_rapidsmpf_memory_recorder_, __LINE__) =                 \
-        ((rapidsmpf::detail::to_pointer(RAPIDSMPF_CONCAT(_rapidsmpf_stats_, __LINE__))   \
-          && rapidsmpf::detail::to_pointer(                                              \
-                 RAPIDSMPF_CONCAT(_rapidsmpf_stats_, __LINE__)                           \
-          ) -> is_memory_profiling_enabled())                                            \
-             ? rapidsmpf::detail::to_pointer(                                            \
-                   RAPIDSMPF_CONCAT(_rapidsmpf_stats_, __LINE__)                         \
-               )                                                                         \
-                   ->create_memory_recorder(                                             \
-                       std::string(__FILE__) + ":" + RAPIDSMPF_STRINGIFY(__LINE__) + "(" \
-                       + std::string(funcname) + ")"                                     \
-                   )                                                                     \
-             : rapidsmpf::Statistics::MemoryRecorder{})
+#define RAPIDSMPF_MEMORY_PROFILE_3(stats, mr, funcname)                                 \
+    auto&& RAPIDSMPF_CONCAT(_rapidsmpf_stats_, __LINE__) = (stats);                     \
+    auto const RAPIDSMPF_CONCAT(_rapidsmpf_memory_recorder_, __LINE__) =                \
+        (rapidsmpf::detail::to_pointer(RAPIDSMPF_CONCAT(_rapidsmpf_stats_, __LINE__)))  \
+            ? rapidsmpf::detail::to_pointer(                                            \
+                  RAPIDSMPF_CONCAT(_rapidsmpf_stats_, __LINE__)                         \
+              )                                                                         \
+                  -> create_memory_recorder(                                            \
+                      (mr),                                                             \
+                      std::string(__FILE__) + ":" + RAPIDSMPF_STRINGIFY(__LINE__) + "(" \
+                          + std::string(funcname) + ")"                                 \
+                  )                                                                     \
+            : rapidsmpf::Statistics::MemoryRecorder {}
 
 }  // namespace rapidsmpf

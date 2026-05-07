@@ -6,8 +6,8 @@
 #include <memory>
 
 #include <cudf/contiguous_split.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
-#include <rapidsmpf/integrations/cudf/utils.hpp>
 #include <rapidsmpf/memory/buffer.hpp>
 #include <rapidsmpf/statistics.hpp>
 #include <rapidsmpf/stream_ordered_timing.hpp>
@@ -35,8 +35,9 @@ TableChunk::TableChunk(
       table_view_{table_view},
       stream_{stream},
       is_spillable_{static_cast<bool>(exclusive_view)} {
-    data_alloc_size_[static_cast<std::size_t>(MemoryType::DEVICE)] =
-        estimated_memory_usage(table_view, stream_);
+    data_alloc_size_[static_cast<std::size_t>(MemoryType::DEVICE)] = cudf::packed_size(
+        table_view, stream_, rmm::mr::get_current_device_resource_ref()
+    );
     make_available_cost_ = 0;
 }
 
@@ -231,6 +232,24 @@ TableChunk TableChunk::copy(MemoryReservation& reservation) const {
     auto data = br->allocate(nbytes, packed_data_->stream(), reservation);
     buffer_copy(br->statistics(), *data, *packed_data_->data, nbytes);
     return TableChunk(std::make_unique<PackedData>(std::move(metadata), std::move(data)));
+}
+
+std::unique_ptr<PackedData> TableChunk::into_packed_data(BufferResource* br) && {
+    if (packed_data_) {
+        table_view_ = std::nullopt;
+        return std::move(packed_data_);
+    }
+    RAPIDSMPF_EXPECTS(
+        is_available(), "TableChunk must be available; call make_available() first"
+    );
+    // TODO: use `cudf::chunked_pack()` with a bounce buffer. Currently,
+    // `cudf::pack()` allocates device memory we haven't reserved.
+    auto packed_columns = cudf::pack(table_view_.value(), stream_, br->device_mr());
+    table_view_ = std::nullopt;
+    return std::make_unique<PackedData>(
+        std::move(packed_columns.metadata),
+        br->move(std::move(packed_columns.gpu_data), stream_)
+    );
 }
 
 std::pair<cudf::size_type, cudf::size_type> TableChunk::shape() const noexcept {

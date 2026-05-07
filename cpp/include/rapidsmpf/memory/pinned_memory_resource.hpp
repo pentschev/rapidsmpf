@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 
 #include <cuda.h>
@@ -18,8 +19,8 @@
 #include <rmm/device_buffer.hpp>
 
 #include <rapidsmpf/config.hpp>
+#include <rapidsmpf/detail/rmm_resource_adaptor_impl.hpp>
 #include <rapidsmpf/error.hpp>
-#include <rapidsmpf/memory/host_memory_resource.hpp>
 #include <rapidsmpf/system_info.hpp>
 #include <rapidsmpf/utils/misc.hpp>
 
@@ -80,31 +81,24 @@ struct PinnedPoolProperties {
 /**
  * @brief Memory resource that provides pinned (page-locked) host memory using a pool.
  *
+ * Inherits from
+ * `cuda::mr::shared_resource<RmmResourceAdaptorImpl<cuda::pinned_memory_pool>>`, which
+ * holds the pool directly inside the shared control block — no extra heap allocation for
+ * the pool itself. Copies share the same underlying pool and memory statistics.
+ *
  * This resource allocates and deallocates pinned host memory asynchronously through
  * CUDA streams. It offers higher bandwidth and lower latency for device transfers
  * compared to regular pageable host memory.
  */
-class PinnedMemoryResource final : public HostMemoryResource {
-  public:
-    /// @brief Sentinel value used to disable pinned host memory.
-    static constexpr auto Disabled = nullptr;
+class PinnedMemoryResource final
+    : public cuda::mr::shared_resource<
+          detail::RmmResourceAdaptorImpl<cuda::pinned_memory_pool>> {
+    using shared_base = cuda::mr::shared_resource<
+        detail::RmmResourceAdaptorImpl<cuda::pinned_memory_pool>>;
 
-    /**
-     * @brief Construct a pinned (page-locked) host memory resource.
-     *
-     * The pool has no maximum size. To restrict its growth, use
-     * `BufferResource::LimitAvailableMemory` or a similar mechanism.
-     *
-     * @param numa_id NUMA node from which memory should be allocated. By default,
-     * the resource uses the NUMA node of the calling thread.
-     * @param pool_properties Properties for configuring the pinned memory pool.
-     *
-     * @throws rapidsmpf::cuda_error If pinned host memory pools are not supported by
-     * the current CUDA version or if CUDA initialization fails.
-     */
-    PinnedMemoryResource(
-        int numa_id = get_current_numa_node(), PinnedPoolProperties pool_properties = {}
-    );
+  public:
+    /// @brief Sentinel value indicating that pinned host memory is disabled.
+    static constexpr std::nullopt_t Disabled = std::nullopt;
 
     /**
      * @brief Create a pinned memory resource if the system supports pinned memory.
@@ -113,12 +107,11 @@ class PinnedMemoryResource final : public HostMemoryResource {
      * current NUMA node.
      * @param pool_properties Properties for configuring the pinned memory pool.
      *
-     * @return A shared pointer to a new `PinnedMemoryResource` when supported,
-     * otherwise `PinnedMemoryResource::Disabled`.
+     * @return A `PinnedMemoryResource` when supported, otherwise `std::nullopt`.
      *
      * @see PinnedMemoryResource::PinnedMemoryResource
      */
-    static std::shared_ptr<PinnedMemoryResource> make_if_available(
+    static std::optional<PinnedMemoryResource> make_if_available(
         int numa_id = get_current_numa_node(), PinnedPoolProperties pool_properties = {}
     );
 
@@ -127,11 +120,10 @@ class PinnedMemoryResource final : public HostMemoryResource {
      *
      * @param options Configuration options.
      *
-     * @return A shared pointer to the constructed PinnedMemoryResource instance.
+     * @return A `PinnedMemoryResource` if pinned memory is enabled and supported,
+     * otherwise `std::nullopt`.
      */
-    static std::shared_ptr<PinnedMemoryResource> from_options(config::Options options);
-
-    ~PinnedMemoryResource() override;
+    static std::optional<PinnedMemoryResource> from_options(config::Options options);
 
     /**
      * @brief Allocates pinned host memory associated with a CUDA stream.
@@ -144,11 +136,14 @@ class PinnedMemoryResource final : public HostMemoryResource {
      * @throw std::bad_alloc If the allocation fails.
      * @throw std::invalid_argument If @p alignment is not a valid alignment.
      */
-    void* allocate(
-        rmm::cuda_stream_view stream,
+
+    [[nodiscard]] void* allocate(
+        cuda::stream_ref stream,
         std::size_t size,
         std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT
-    ) override;
+    ) {
+        return get().allocate(stream, size, alignment);
+    }
 
     /**
      * @brief Deallocates pinned host memory associated with a CUDA stream.
@@ -159,40 +154,83 @@ class PinnedMemoryResource final : public HostMemoryResource {
      * @param alignment Alignment originally used for the allocation.
      */
     void deallocate(
-        rmm::cuda_stream_view stream,
+        cuda::stream_ref stream,
         void* ptr,
         std::size_t size,
         std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT
-    ) noexcept override;
+    ) noexcept {
+        get().deallocate(stream, ptr, size, alignment);
+    }
 
     /**
-     * @brief Compares this resource to another resource.
+     * @brief Equality comparison.
      *
-     * Two resources are considered equal if memory allocated by one may be
-     * deallocated by the other.
-     *
-     * @param other The resource to compare with.
-     * @return true because all instances of this base class are considered equal.
+     * @param other The other resource to compare.
+     * @return True if the two resources share the same underlying shared state.
      */
-    [[nodiscard]] bool is_equal(HostMemoryResource const& other) const noexcept override;
+    [[nodiscard]] bool operator==(PinnedMemoryResource const& other) const noexcept {
+        return get() == other.get();
+    }
+
+    /**
+     * @brief Returns the total number of currently allocated bytes.
+     *
+     * @return The total number of currently allocated bytes.
+     */
+    [[nodiscard]] std::int64_t current_allocated() const noexcept {
+        return get().current_allocated();
+    }
+
+    /**
+     * @brief Returns the main memory record for the pinned pool.
+     *
+     * @return The main memory record for the pinned pool.
+     */
+    [[nodiscard]] ScopedMemoryRecord get_main_memory_record() const {
+        return get().get_main_record();
+    }
+
+    /**
+     * @brief Returns the properties used to configure the pool.
+     *
+     * @return The properties used to configure the pool.
+     */
+    [[nodiscard]] constexpr PinnedPoolProperties const& properties() const noexcept {
+        return pool_properties_;
+    }
+
+    /**
+     * @brief Returns a memory-availability callback for the pinned pool, if the pool has
+     * a configured maximum size.
+     *
+     * @return A callable `std::int64_t()`. If no maximum pool size is configured, returns
+     * `std::numeric_limits<std::int64_t>::%max` (unbounded).
+     */
+    [[nodiscard]] std::function<std::int64_t()> get_memory_available_cb() const;
 
     /**
      * @brief Enables the `cuda::mr::host_accessible` property.
-     *
-     * This property declares that a `HostMemoryResource` provides host accessible memory.
      */
     friend void get_property(
-        PinnedMemoryResource const&, cuda::mr::device_accessible
+        PinnedMemoryResource const&, cuda::mr::host_accessible
     ) noexcept {}
 
   private:
-    // We cannot assign cuda::pinned_memory_pool directly to device_async_resource_ref /
-    // host_async_resource_ref: the ref only stores a pointer, but its constructor
-    // requires the referenced type to be copyable and movable (CCCL __basic_any_ref
-    // constraint). pinned_memory_pool is not copyable, so we wrap it in
-    // PinnedMemoryResource, which holds the pool in a shared_resource and is copyable and
-    // movable. Copies share the same pool (is_equal compares pool_ pointers).
-    cuda::mr::shared_resource<cuda::pinned_memory_pool> pool_;
+    /**
+     * @brief Construct a pinned (page-locked) host memory resource.
+     *
+     * Private — use `make_if_available` or `from_options` to obtain an instance.
+     *
+     * @param numa_id NUMA node from which memory should be allocated.
+     * @param pool_properties Properties for configuring the pinned memory pool.
+     *
+     * @throws std::invalid_argument If pinned host memory pools are not supported.
+     */
+    PinnedMemoryResource(
+        int numa_id = get_current_numa_node(), PinnedPoolProperties pool_properties = {}
+    );
+
+    PinnedPoolProperties pool_properties_;  ///< properties used to configure the pool
 };
 
 static_assert(cuda::mr::resource<PinnedMemoryResource>);

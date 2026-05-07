@@ -8,7 +8,7 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v20.1.4
+    rev: v20.1.8
     hooks:
       - id: clang-format
         types_or: [c, c++, cuda]
@@ -48,6 +48,17 @@ repos:
         language: system
         pass_filenames: false
         verbose: true
+      - id: use-rapidsmpf-cuda-memcpy-async
+        name: use-rapidsmpf-cuda-memcpy-async
+        description: 'Enforce that rapidsmpf::cuda_memcpy_async is used instead of cudaMemcpyAsync directly (see cpp/include/rapidsmpf/memory/cuda_memcpy_async.hpp)'
+        entry: 'cudaMemcpyAsync'
+        language: pygrep
+        types_or: [c, c++, cuda]
+        files: '^cpp/'
+        exclude: |
+          (?x)^(
+            cpp/include/rapidsmpf/memory/cuda_memcpy_async\.hpp
+          )$
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: 9b1e9a33f1b33f6ecc2fdbb8d7cc894e951106e4  # frozen: v0.14.13
     hooks:
@@ -123,6 +134,10 @@ repos:
     rev: 745eface02aef23e168a8afb6b5737818efbea95  # frozen: v0.11.0.1
     hooks:
       - id: shellcheck
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: a4727cbbcd26d7098e96b9cb738169b59711ae51 # v1.24.1
+    hooks:
+      - id: zizmor
 
 default_language_version:
       python: python3

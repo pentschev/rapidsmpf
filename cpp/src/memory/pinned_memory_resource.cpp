@@ -17,8 +17,9 @@
 namespace rapidsmpf {
 
 namespace {
+
 cuda::memory_pool_properties get_memory_pool_properties(
-    PinnedPoolProperties pool_properties
+    PinnedPoolProperties const& pool_properties
 ) {
     return cuda::memory_pool_properties{
         // It was observed that priming async device pools have little effect on
@@ -37,47 +38,45 @@ cuda::memory_pool_properties get_memory_pool_properties(
     };
 }
 
-cuda::mr::shared_resource<cuda::pinned_memory_pool> make_pinned_memory_pool(
-    int numa_id, PinnedPoolProperties props
-) {
-    RAPIDSMPF_EXPECTS(
-        is_pinned_memory_resources_supported(),
-        "Pinned host memory is not supported on this system. "
-        "CUDA " RAPIDSMPF_PINNED_MEM_RES_MIN_CUDA_VERSION_STR
-        " is one of the requirements, but additional platform or driver constraints may "
-        "apply. If needed, use `PinnedMemoryResource::Disabled` to disable pinned host "
-        "memory, noting that this may significantly degrade spilling performance.",
-        std::invalid_argument
-    );
-    return cuda::mr::make_shared_resource<cuda::pinned_memory_pool>(
-        numa_id, get_memory_pool_properties(props)
-    );
-}
 }  // namespace
 
 PinnedMemoryResource::PinnedMemoryResource(
     int numa_id, PinnedPoolProperties pool_properties
 )
-    : pool_{make_pinned_memory_pool(numa_id, std::move(pool_properties))} {}
+    : shared_base([&] {
+          RAPIDSMPF_EXPECTS(
+              is_pinned_memory_resources_supported(),
+              "Pinned host memory is not supported on this system. "
+              "CUDA " RAPIDSMPF_PINNED_MEM_RES_MIN_CUDA_VERSION_STR
+              " is one of the requirements, but additional platform or driver "
+              "constraints may apply. If needed, use `PinnedMemoryResource::Disabled` "
+              "to disable pinned host memory, noting that this may significantly "
+              "degrade spilling performance.",
+              std::invalid_argument
+          );
+          return cuda::mr::make_shared_resource<
+              detail::RmmResourceAdaptorImpl<cuda::pinned_memory_pool>>(
+              std::in_place, numa_id, get_memory_pool_properties(pool_properties)
+          );
+      }()),
+      pool_properties_{std::move(pool_properties)} {}
 
-std::shared_ptr<PinnedMemoryResource> PinnedMemoryResource::make_if_available(
+std::optional<PinnedMemoryResource> PinnedMemoryResource::make_if_available(
     int numa_id, PinnedPoolProperties pool_properties
 ) {
     if (is_pinned_memory_resources_supported()) {
-        return std::make_shared<rapidsmpf::PinnedMemoryResource>(
-            numa_id, std::move(pool_properties)
-        );
+        return PinnedMemoryResource{numa_id, std::move(pool_properties)};
     }
     return PinnedMemoryResource::Disabled;
 }
 
-std::shared_ptr<PinnedMemoryResource> PinnedMemoryResource::from_options(
+std::optional<PinnedMemoryResource> PinnedMemoryResource::from_options(
     config::Options options
 ) {
     bool const pinned_memory = options.get<bool>("pinned_memory", [](auto const& s) {
-        return parse_string<bool>(s.empty() ? "False" : s);
+        return parse_string<bool>(s.empty() ? "True" : s);
     });
-    if (pinned_memory) {
+    if (pinned_memory && is_pinned_memory_resources_supported()) {
         PinnedPoolProperties pool_properties{
             .initial_pool_size = options.get<size_t>(
                 "pinned_initial_pool_size",
@@ -93,30 +92,20 @@ std::shared_ptr<PinnedMemoryResource> PinnedMemoryResource::from_options(
                 }
             )
         };
-        return PinnedMemoryResource::make_if_available(
-            get_current_numa_node(), std::move(pool_properties)
-        );
+        return PinnedMemoryResource{get_current_numa_node(), std::move(pool_properties)};
     }
     return PinnedMemoryResource::Disabled;
 }
 
-PinnedMemoryResource::~PinnedMemoryResource() = default;
-
-void* PinnedMemoryResource::allocate(
-    rmm::cuda_stream_view stream, std::size_t bytes, std::size_t alignment
-) {
-    return pool_->allocate(stream, bytes, alignment);
-}
-
-void PinnedMemoryResource::deallocate(
-    rmm::cuda_stream_view stream, void* ptr, std::size_t bytes, std::size_t alignment
-) noexcept {
-    pool_->deallocate(stream, ptr, bytes, alignment);
-}
-
-bool PinnedMemoryResource::is_equal(HostMemoryResource const& other) const noexcept {
-    auto const* o = dynamic_cast<PinnedMemoryResource const*>(&other);
-    return o != nullptr && pool_ == o->pool_;
+std::function<std::int64_t()> PinnedMemoryResource::get_memory_available_cb() const {
+    auto const max_pool_size = pool_properties_.max_pool_size.value_or(0);
+    if (max_pool_size > 0) {
+        auto const limit = safe_cast<std::int64_t>(max_pool_size);
+        return [tracker = *this, limit]() {
+            return limit - tracker.get().current_allocated();
+        };
+    }
+    return std::numeric_limits<std::int64_t>::max;
 }
 
 }  // namespace rapidsmpf

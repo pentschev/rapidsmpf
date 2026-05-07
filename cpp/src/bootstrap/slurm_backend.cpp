@@ -10,10 +10,12 @@
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <utility>
 
 #include <rapidsmpf/bootstrap/slurm_backend.hpp>
+#include <rapidsmpf/bootstrap/utils.hpp>
 
 // NOTE: Do not use RAPIDSMPF_EXPECTS or RAPIDSMPF_FAIL in this file.
 // Using these macros introduces a CUDA dependency via rapidsmpf/error.hpp.
@@ -125,13 +127,14 @@ SlurmBackend::~SlurmBackend() {
     PMIx_Finalize(nullptr, 0);
 }
 
-void SlurmBackend::put(std::string const& key, std::string const& value) {
+void SlurmBackend::put(std::string const& key, std::string_view value) {
     if (ctx_.rank != 0) {
         throw std::runtime_error(
             "put() can only be called by rank 0, but was called by rank "
             + std::to_string(ctx_.rank)
         );
     }
+    validate_key(key);
 
     // PMIx_Put stores the key-value pair in the LOCAL PMIx cache of the
     // calling rank. PMIX_GLOBAL is a scope indicator meaning "intended to
@@ -158,6 +161,7 @@ void SlurmBackend::commit() {
 }
 
 std::string SlurmBackend::get(std::string const& key, Duration timeout) {
+    validate_key(key);
     auto start = std::chrono::steady_clock::now();
     auto poll_interval = std::chrono::milliseconds{100};
 

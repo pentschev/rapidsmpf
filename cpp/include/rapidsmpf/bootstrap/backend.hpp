@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 
 #include <rapidsmpf/bootstrap/types.hpp>
 
@@ -20,9 +21,10 @@ enum class BackendType {
      * @brief Automatically detect the best backend based on environment.
      *
      * Detection order:
-     * 1. File-based (if RRUN_COORD_DIR set by rrun)
-     * 2. Slurm/PMIx (if SLURM environment detected)
-     * 3. File-based (default fallback)
+     * 1. Socket-based (if RRUN_SOCKET_ADDR set by rrun)
+     * 2. File-based (if RRUN_COORD_DIR set by rrun, backward compatibility)
+     * 3. Slurm/PMIx (if SLURM environment detected)
+     * 4. File-based (default fallback)
      */
     AUTO,
 
@@ -34,6 +36,20 @@ enum class BackendType {
      * RRUN_NRANKS, RRUN_COORD_DIR environment variables.
      */
     FILE,
+
+    /**
+     * @brief Socket-based coordination using an in-process TCP server (rrun-hosted).
+     *
+     * The rrun launcher starts a TCP server on 127.0.0.1 before forking ranks and
+     * passes the ephemeral port and a 256-bit random token to all child processes.
+     *
+     * Environment variables (set by rrun):
+     * - RRUN_SOCKET_ADDR: "host:port" of the coordinator server
+     * - RRUN_SOCKET_TOKEN: 64-hex-char authentication token
+     * - RRUN_RANK: This process's rank (0-indexed)
+     * - RRUN_NRANKS: Total number of ranks
+     */
+    SOCKET,
 
     /**
      * @brief Slurm-based coordination using PMIx.
@@ -78,7 +94,7 @@ class Backend {
      *
      * @throws std::runtime_error if called by non-zero rank.
      */
-    virtual void put(std::string const& key, std::string const& value) = 0;
+    virtual void put(std::string const& key, std::string_view value) = 0;
 
     /**
      * @brief Retrieve a value, blocking until available or timeout occurs.

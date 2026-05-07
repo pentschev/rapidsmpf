@@ -122,6 +122,7 @@ include(../cmake/Modules/ConfigureCUDA.cmake) # set other CUDA compilation flags
 
 # ##################################################################################################
 # * dependencies ----------------------------------------------------------------------------------
+
 rapids_cpm_init()
 
 rapids_find_package(
@@ -182,8 +183,11 @@ add_library(
   rapidsmpf
   src/coll/allgather.cpp
   src/coll/allreduce.cpp
+  src/coll/sparse_alltoall.cpp
+  src/coll/utils.cpp
   src/bootstrap/bootstrap.cpp
   src/bootstrap/file_backend.cpp
+  src/bootstrap/socket_backend.cpp
   src/bootstrap/utils.cpp
   src/communicator/communicator.cpp
   src/communicator/metadata_payload_exchange/core.cpp
@@ -206,6 +210,7 @@ add_library(
   src/pausable_thread_loop.cpp
   src/progress_thread.cpp
   src/rmm_resource_adaptor.cpp
+  src/rrun/rrun.cpp
   src/shuffler/chunk.cpp
   src/shuffler/finish_counter.cpp
   src/shuffler/postbox.cpp
@@ -224,6 +229,7 @@ if(RAPIDSMPF_HAVE_STREAMING)
             src/streaming/coll/allgather.cpp
             src/streaming/coll/allreduce.cpp
             src/streaming/coll/shuffler.cpp
+            src/streaming/coll/sparse_alltoall.cpp
             src/streaming/core/actor.cpp
             src/streaming/core/channel.cpp
             src/streaming/core/context.cpp
@@ -437,6 +443,7 @@ install(
   EXPORT rapidsmpf-exports
 )
 install(DIRECTORY include/rapidsmpf/ DESTINATION include/rapidsmpf)
+install(DIRECTORY include/rrun/ DESTINATION include/rrun)
 
 set(doc_string
     [=[

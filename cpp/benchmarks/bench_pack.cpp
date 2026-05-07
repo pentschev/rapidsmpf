@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <memory>
 
 #include <benchmark/benchmark.h>
 
@@ -19,6 +18,7 @@
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <rapidsmpf/memory/cuda_memcpy_async.hpp>
 #include <rapidsmpf/memory/pinned_memory_resource.hpp>
 
 #include "utils/random_data.hpp"
@@ -74,9 +74,8 @@ static void BM_Pack_device(benchmark::State& state) {
     rmm::cuda_stream_view stream = rmm::cuda_stream_default;
 
     // Create memory resources
-    rmm::mr::cuda_async_memory_resource cuda_mr;
-    rmm::mr::pool_memory_resource<rmm::mr::cuda_async_memory_resource> pool_mr{
-        cuda_mr, rmm::percent_of_free_device_memory(40)
+    rmm::mr::pool_memory_resource pool_mr{
+        rmm::mr::cuda_async_memory_resource{}, rmm::percent_of_free_device_memory(40)
     };
     run_pack(state, table_size_mb, pool_mr, pool_mr, stream);
 }
@@ -96,11 +95,9 @@ static void BM_Pack_pinned(benchmark::State& state) {
     rmm::cuda_stream_view stream = rmm::cuda_stream_default;
 
     // Create memory resources
-    rmm::mr::cuda_async_memory_resource cuda_mr;
-    rmm::mr::pool_memory_resource<rmm::mr::cuda_async_memory_resource> pool_mr{
-        cuda_mr, rmm::percent_of_free_device_memory(40)
+    rmm::mr::pool_memory_resource pool_mr{
+        rmm::mr::cuda_async_memory_resource{}, rmm::percent_of_free_device_memory(40)
     };
-    rapidsmpf::PinnedMemoryResource pinned_mr;
 
     run_pack(state, table_size_mb, pool_mr, pinned_mr, stream); */
 }
@@ -147,13 +144,14 @@ void run_chunked_pack(
                     static_cast<std::uint8_t*>(bounce_buffer.data()), bounce_buffer_size
                 )
             );
-            RAPIDSMPF_CUDA_TRY(cudaMemcpyAsync(
-                static_cast<std::uint8_t*>(destination.data()) + offset,
-                bounce_buffer.data(),
-                bytes_copied,
-                cudaMemcpyDefault,
-                stream.value()
-            ));
+            RAPIDSMPF_CUDA_TRY(
+                rapidsmpf::cuda_memcpy_async(
+                    static_cast<std::uint8_t*>(destination.data()) + offset,
+                    bounce_buffer.data(),
+                    bytes_copied,
+                    stream
+                )
+            );
             offset += bytes_copied;
         }
     };
@@ -192,9 +190,8 @@ static void BM_ChunkedPack_device(benchmark::State& state) {
 
     rmm::cuda_stream_view stream = rmm::cuda_stream_default;
 
-    rmm::mr::cuda_async_memory_resource cuda_mr;
-    rmm::mr::pool_memory_resource<rmm::mr::cuda_async_memory_resource> pool_mr{
-        cuda_mr, rmm::percent_of_free_device_memory(40)
+    rmm::mr::pool_memory_resource pool_mr{
+        rmm::mr::cuda_async_memory_resource{}, rmm::percent_of_free_device_memory(40)
     };
 
     run_chunked_pack(
@@ -220,9 +217,8 @@ static void BM_ChunkedPack_pinned(benchmark::State& state) {
 
     rmm::cuda_stream_view stream = rmm::cuda_stream_default;
 
-    rmm::mr::cuda_async_memory_resource cuda_mr;
-    rmm::mr::pool_memory_resource<rmm::mr::cuda_async_memory_resource> pool_mr{
-        cuda_mr, rmm::percent_of_free_device_memory(40)
+    rmm::mr::pool_memory_resource pool_mr{
+        rmm::mr::cuda_async_memory_resource{}, rmm::percent_of_free_device_memory(40)
     };
     rapidsmpf::PinnedMemoryResource pinned_mr;
 
@@ -232,7 +228,7 @@ static void BM_ChunkedPack_pinned(benchmark::State& state) {
 }
 
 // Custom argument generator for the benchmark
-void PackArguments(benchmark::internal::Benchmark* b) {
+void PackArguments(benchmark::Benchmark* b) {
     // Test different table sizes in MB (minimum 1MB as requested)
     for (auto size_mb : {1, 10, 100, 500, 1000, 2000, 4000}) {
         b->Args({size_mb});
@@ -270,10 +266,8 @@ static void BM_ChunkedPack_fixed_table_device(benchmark::State& state) {
     rmm::cuda_stream_view stream = rmm::cuda_stream_default;
 
     // Create memory resources
-    rmm::mr::cuda_async_memory_resource cuda_mr;
-
-    rmm::mr::pool_memory_resource<rmm::mr::cuda_async_memory_resource> pool_mr{
-        cuda_mr, rmm::percent_of_free_device_memory(40)
+    rmm::mr::pool_memory_resource pool_mr{
+        rmm::mr::cuda_async_memory_resource{}, rmm::percent_of_free_device_memory(40)
     };
 
     run_chunked_pack(
@@ -297,9 +291,8 @@ static void BM_ChunkedPack_fixed_table_pinned(benchmark::State& state) {
 
     rmm::cuda_stream_view stream = rmm::cuda_stream_default;
 
-    rmm::mr::cuda_async_memory_resource cuda_mr;
-    rmm::mr::pool_memory_resource<rmm::mr::cuda_async_memory_resource> pool_mr{
-        cuda_mr, rmm::percent_of_free_device_memory(40)
+    rmm::mr::pool_memory_resource pool_mr{
+        rmm::mr::cuda_async_memory_resource{}, rmm::percent_of_free_device_memory(40)
     };
     rapidsmpf::PinnedMemoryResource pinned_mr;
 
@@ -309,7 +302,7 @@ static void BM_ChunkedPack_fixed_table_pinned(benchmark::State& state) {
 }
 
 // Custom argument generator for the benchmark
-void ChunkedPackArguments(benchmark::internal::Benchmark* b) {
+void ChunkedPackArguments(benchmark::Benchmark* b) {
     // Test different table sizes in MB (minimum 1MB as requested)
     for (auto bounce_buf_sz_mb : {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}) {
         b->Args({bounce_buf_sz_mb});

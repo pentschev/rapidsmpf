@@ -117,6 +117,9 @@ def test_read_parquet(
     num_rows: int | Literal["all"],
     use_filter: bool,  # noqa: FBT001
 ) -> None:
+    if comm.nranks != 1:
+        pytest.skip("Only support single-rank runs")
+
     ch: Channel[TableChunk] = context.create_channel()
 
     options = plc.io.parquet.ParquetReaderOptions.builder(source).build()
@@ -137,7 +140,7 @@ def test_read_parquet(
         m1.sequence_number < m2.sequence_number
         for m1, m2 in itertools.pairwise(messages)
     )
-    chunks = [TableChunk.from_message(m) for m in messages]
+    chunks = [TableChunk.from_message(m, br=context.br()) for m in messages]
     for chunk in chunks:
         chunk.stream.synchronize()
 

@@ -129,9 +129,8 @@ streaming::Actor consume_channel(
 }
 
 std::pair<std::shared_ptr<streaming::Context>, std::shared_ptr<Communicator>>
-create_context(ProgramOptions& arguments, RmmResourceAdaptor* mr) {
+create_context(ProgramOptions& arguments, RmmResourceAdaptor&& mr) {
     rmm::mr::set_current_device_resource(mr);
-    rmm::mr::set_current_device_resource_ref(mr);
     std::unordered_map<MemoryType, BufferResource::MemoryAvailable> memory_available{};
     if (arguments.spill_device_limit.has_value()) {
         auto limit_size = rmm::align_down(
@@ -144,7 +143,7 @@ create_context(ProgramOptions& arguments, RmmResourceAdaptor* mr) {
         memory_available[MemoryType::DEVICE] =
             LimitAvailableMemory{mr, static_cast<std::int64_t>(limit_size)};
     }
-    auto statistics = std::make_shared<Statistics>(mr);
+    auto statistics = std::make_shared<Statistics>(/* enable = */ true);
 
     RAPIDSMPF_EXPECTS(
         arguments.no_pinned_host_memory || is_pinned_memory_resources_supported(),
@@ -157,9 +156,9 @@ create_context(ProgramOptions& arguments, RmmResourceAdaptor* mr) {
     );
 
     auto br = std::make_shared<BufferResource>(
-        mr,
+        std::move(mr),
         arguments.no_pinned_host_memory ? PinnedMemoryResource::Disabled
-                                        : std::make_shared<PinnedMemoryResource>(),
+                                        : PinnedMemoryResource::make_if_available(),
         std::move(memory_available),
         arguments.periodic_spill,
         std::make_shared<rmm::cuda_stream_pool>(

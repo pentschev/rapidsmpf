@@ -30,7 +30,7 @@
 
 #include "utils/misc.hpp"
 #include "utils/random_data.hpp"
-#include "utils/rmm_stack.hpp"
+#include "utils/rmm_utils.hpp"
 
 
 using namespace rapidsmpf;
@@ -314,7 +314,7 @@ int main(int argc, char** argv) {
     auto& log = comm->logger();
     rmm::cuda_stream_view stream = cudf::get_default_stream();
     args.pprint(*comm);
-    auto const mr_stack = set_current_rmm_stack(args.rmm_mr);
+    set_current_rmm_resource(args.rmm_mr);
 
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref();
     BufferResource br{
@@ -400,7 +400,7 @@ int main(int argc, char** argv) {
            << "/s | num_ops: " << args.num_ops << " | nranks: " << comm->nranks();
         log->print(ss.str());
     }
-    log->print(stats->report("Statistics (of the last run):"));
+    log->print(stats->report({.header = "Statistics (of the last run):"}));
 
 #ifdef RAPIDSMPF_HAVE_CUPTI
     // Save CUPTI monitoring results to CSV file

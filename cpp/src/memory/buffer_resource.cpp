@@ -7,10 +7,13 @@
 #include <stdexcept>
 #include <utility>
 
+#include <cuda/memory_resource>
+
 #include <rapidsmpf/cuda_stream.hpp>
 #include <rapidsmpf/error.hpp>
 #include <rapidsmpf/memory/buffer_resource.hpp>
 #include <rapidsmpf/memory/host_buffer.hpp>
+#include <rapidsmpf/memory/host_memory_resource.hpp>
 #include <rapidsmpf/stream_ordered_timing.hpp>
 #include <rapidsmpf/utils/string.hpp>
 
@@ -34,8 +37,8 @@ auto add_missing_availability_functions(
 }  // namespace
 
 BufferResource::BufferResource(
-    rmm::device_async_resource_ref device_mr,
-    std::shared_ptr<PinnedMemoryResource> pinned_mr,
+    cuda::mr::any_resource<cuda::mr::device_accessible> device_mr,
+    std::optional<PinnedMemoryResource> pinned_mr,
     std::unordered_map<MemoryType, MemoryAvailable> memory_available,
     std::optional<Duration> periodic_spill_check,
     std::shared_ptr<rmm::cuda_stream_pool> stream_pool,
@@ -43,6 +46,7 @@ BufferResource::BufferResource(
 )
     : device_mr_{std::move(device_mr)},
       pinned_mr_{std::move(pinned_mr)},
+      host_mr_{},
       memory_available_{add_missing_availability_functions(
           std::move(memory_available), pinned_mr_ == PinnedMemoryResource::Disabled
       )},
@@ -54,36 +58,59 @@ BufferResource::BufferResource(
 }
 
 std::shared_ptr<BufferResource> BufferResource::from_options(
-    RmmResourceAdaptor* mr, config::Options options
+    RmmResourceAdaptor mr, config::Options options
 ) {
+    auto pinned_mr = PinnedMemoryResource::from_options(options);
+    auto mem_available = memory_available_from_options(mr, options);
+
+    if (pinned_mr != PinnedMemoryResource::Disabled) {
+        mem_available[MemoryType::PINNED_HOST] = pinned_mr->get_memory_available_cb();
+    }
+
+    auto statistics = Statistics::from_options(options);
     return std::make_shared<BufferResource>(
-        mr,
-        PinnedMemoryResource::from_options(options),
-        memory_available_from_options(mr, options),
+        std::move(mr),
+        std::move(pinned_mr),
+        std::move(mem_available),
         periodic_spill_check_from_options(options),
         stream_pool_from_options(options),
-        Statistics::from_options(mr, options)
+        std::move(statistics)
     );
 }
 
 rmm::device_async_resource_ref BufferResource::device_mr() const noexcept {
-    return device_mr_;
+    return rmm::device_async_resource_ref{
+        const_cast<cuda::mr::any_resource<cuda::mr::device_accessible>&>(device_mr_)
+    };
 }
 
 rmm::host_async_resource_ref BufferResource::host_mr() noexcept {
     return host_mr_;
 }
 
-rmm::host_async_resource_ref BufferResource::pinned_mr() {
+rmm::host_device_async_resource_ref BufferResource::pinned_mr() {
     RAPIDSMPF_EXPECTS(
         pinned_mr_, "no pinned memory resource is available", std::invalid_argument
     );
     return *pinned_mr_;
 }
 
+std::optional<any_host_device_resource> BufferResource::try_pinned_mr() const noexcept {
+    // since any_host_device_resource is constructible from
+    // host_device_async_resource_ref, optional can be returned as-is.
+    return pinned_mr_;
+}
+
 std::pair<MemoryReservation, std::size_t> BufferResource::reserve(
     MemoryType mem_type, std::size_t size, AllowOverbooking allow_overbooking
 ) {
+    RAPIDSMPF_EXPECTS(
+        mem_type != MemoryType::PINNED_HOST
+            || pinned_mr_ != PinnedMemoryResource::Disabled,
+        "pinned memory resource is not available",
+        std::invalid_argument
+    );
+
     auto const& available = memory_available(mem_type);
     std::lock_guard<std::mutex> lock(mutex_);
     std::size_t& reserved = memory_reserved_[static_cast<std::size_t>(mem_type)];
@@ -245,13 +272,14 @@ std::shared_ptr<Statistics> BufferResource::statistics() {
 }
 
 std::unordered_map<MemoryType, BufferResource::MemoryAvailable>
-memory_available_from_options(RmmResourceAdaptor* mr, config::Options options) {
+memory_available_from_options(RmmResourceAdaptor mr, config::Options options) {
     // Create a memory availability map that limits device memory based on the
     // `spill_device_limit` option.
     return {
         {MemoryType::DEVICE,
          LimitAvailableMemory{
-             mr, options.get<std::int64_t>("spill_device_limit", [](auto const& s) {
+             std::move(mr),
+             options.get<std::int64_t>("spill_device_limit", [](auto const& s) {
                  auto const [_, total_mem] = rmm::available_device_memory();
                  return rmm::align_down(
                      parse_nbytes_or_percent(s.empty() ? "80%" : s, total_mem),

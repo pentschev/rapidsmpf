@@ -9,12 +9,12 @@
 #include <gtest/gtest.h>
 
 #include <rmm/mr/cuda_memory_resource.hpp>
-#include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <rapidsmpf/communicator/communicator.hpp>
 #include <rapidsmpf/memory/buffer.hpp>
 #include <rapidsmpf/memory/buffer_resource.hpp>
+#include <rapidsmpf/memory/cuda_memcpy_async.hpp>
 
 #include "environment.hpp"
 #include "utils.hpp"
@@ -23,17 +23,15 @@ class BaseCommunicatorTest : public ::testing::Test {
   protected:
     void SetUp() override {
         comm = GlobalEnvironment->comm_.get();
-        mr = std::unique_ptr<rmm::mr::device_memory_resource>(
-            new rmm::mr::cuda_memory_resource{}
-        );
-        br = std::make_unique<rapidsmpf::BufferResource>(mr.get());
+        mr = std::make_unique<rmm::mr::cuda_memory_resource>();
+        br = std::make_unique<rapidsmpf::BufferResource>(*mr);
         stream = rmm::cuda_stream_default;
     }
 
     void TearDown() override {}
 
     rapidsmpf::Communicator* comm;
-    std::unique_ptr<rmm::mr::device_memory_resource> mr;
+    std::unique_ptr<rmm::mr::cuda_memory_resource> mr;
     rmm::cuda_stream_view stream;
     std::unique_ptr<rapidsmpf::BufferResource> br;
 };
@@ -83,9 +81,11 @@ TEST_P(BasicCommunicatorTest, SendToSelf) {
     auto send_data_h = iota_vector<std::uint8_t>(nelems);
     auto send_buf = br->allocate(stream, br->reserve_or_fail(nelems, memory_type()));
     send_buf->write_access([&](std::byte* send_buf_data, rmm::cuda_stream_view stream) {
-        RAPIDSMPF_CUDA_TRY(cudaMemcpyAsync(
-            send_buf_data, send_data_h.data(), nelems, cudaMemcpyDefault, stream
-        ));
+        RAPIDSMPF_CUDA_TRY(
+            rapidsmpf::cuda_memcpy_async(
+                send_buf_data, send_data_h.data(), nelems, stream
+            )
+        );
     });
     send_buf->stream().synchronize();
     rapidsmpf::Tag tag{0, 0};

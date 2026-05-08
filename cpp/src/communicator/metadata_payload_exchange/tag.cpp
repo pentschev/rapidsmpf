@@ -179,91 +179,124 @@ bool TagMetadataPayloadExchange::is_idle() const {
 }
 
 void TagMetadataPayloadExchange::receive_metadata() {
-    auto& log = comm_->logger();
     auto const t0 = Clock::now();
 
-    // Use per-peer recv_from to avoid consuming messages belonging to a future
-    // collective on the same tag (see rapidsai/rapidsmpf#927).
+    if (nranks_ == 1) {
+        statistics_->add_duration_stat(
+            "metadata-payload-exchange-receive-metadata", Clock::now() - t0
+        );
+        return;
+    }
+
+    // Use wildcard receives while every peer still has current-exchange metadata
+    // outstanding. Once any peer is done, switch to per-peer receives so we never
+    // consume that peer's future-exchange metadata on a reused tag.
+    while (can_recv_any()) {
+        auto [msg, peer] = comm_->recv_any(metadata_tag_);
+        if (!msg) {
+            statistics_->add_duration_stat(
+                "metadata-payload-exchange-receive-metadata", Clock::now() - t0
+            );
+            return;
+        }
+        process_metadata_message(std::move(msg), peer, "recv_any");
+    }
+
     for (Rank peer = 0; peer < nranks_; ++peer) {
-        if (peer == rank_) {
+        if (peer == rank_ || peer_done(peer)) {
             continue;
         }
-        auto const p = safe_cast<std::size_t>(peer);
-
-        // Skip peers that are fully done.
-        if (peer_terminated_[p] && peer_received_[p] >= peer_expected_[p]) {
-            continue;
-        }
-
         while (true) {
             auto msg = comm_->recv_from(peer, metadata_tag_);
             if (!msg) {
                 break;
             }
-
-            RAPIDSMPF_EXPECTS(
-                msg->size() >= sizeof(std::uint64_t) + sizeof(std::size_t),
-                "Truncated metadata"
-            );
-
-            // Extract message_id and payload_size from the protocol trailer.
-            std::size_t const protocol_overhead =
-                sizeof(std::uint64_t) + sizeof(std::size_t);
-            std::size_t const original_metadata_size = msg->size() - protocol_overhead;
-
-            std::uint64_t message_id;
-            std::memcpy(
-                &message_id, msg->data() + original_metadata_size, sizeof(std::uint64_t)
-            );
-
-            std::size_t payload_size;
-            std::memcpy(
-                &payload_size,
-                msg->data() + original_metadata_size + sizeof(std::uint64_t),
-                sizeof(std::size_t)
-            );
-
-            // Check for termination marker.
-            if (message_id == termination_sentinel_) {
-                peer_expected_[p] = payload_size;  // payload_size carries the count
-                peer_terminated_[p] = true;
-                log->trace(
-                    "recv termination from ",
-                    peer,
-                    " (expected_messages=",
-                    payload_size,
-                    ")"
-                );
+            process_metadata_message(std::move(msg), peer, "recv_from");
+            if (peer_done(peer)) {
                 break;
             }
-
-            // Normal application message.
-            peer_received_[p]++;
-
-            std::vector<std::uint8_t> original_metadata(
-                msg->begin(),
-                msg->begin() + safe_cast<std::ptrdiff_t>(original_metadata_size)
-            );
-
-            std::unique_ptr<Buffer> buffer = nullptr;
-            if (payload_size > 0) {
-                buffer = allocate_buffer_fn_(payload_size);
-            }
-
-            auto message = std::make_unique<MetadataPayloadExchange::Message>(
-                peer, std::move(original_metadata), std::move(buffer)
-            );
-
-            log->trace("recv_from ", peer, " (message_id=", message_id, ")");
-            incoming_messages_[peer].emplace_back(
-                std::move(message), message_id, payload_size
-            );
         }
     }
 
     statistics_->add_duration_stat(
         "metadata-payload-exchange-receive-metadata", Clock::now() - t0
     );
+}
+
+bool TagMetadataPayloadExchange::peer_done(Rank peer) const {
+    auto const p = safe_cast<std::size_t>(peer);
+    return peer_terminated_[p] && peer_received_[p] >= peer_expected_[p];
+}
+
+bool TagMetadataPayloadExchange::can_recv_any() const {
+    for (Rank peer = 0; peer < nranks_; ++peer) {
+        if (peer != rank_ && peer_done(peer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void TagMetadataPayloadExchange::process_metadata_message(
+    std::unique_ptr<std::vector<std::uint8_t>> msg, Rank peer, char const* receive_name
+) {
+    auto& log = comm_->logger();
+    auto const p = safe_cast<std::size_t>(peer);
+
+    RAPIDSMPF_EXPECTS(peer != rank_, "received metadata from self");
+    RAPIDSMPF_EXPECTS(!peer_done(peer), "received metadata from a completed peer");
+    RAPIDSMPF_EXPECTS(
+        msg->size() >= sizeof(std::uint64_t) + sizeof(std::size_t), "Truncated metadata"
+    );
+
+    // Extract message_id and payload_size from the protocol trailer.
+    std::size_t const protocol_overhead = sizeof(std::uint64_t) + sizeof(std::size_t);
+    std::size_t const original_metadata_size = msg->size() - protocol_overhead;
+
+    std::uint64_t message_id;
+    std::memcpy(&message_id, msg->data() + original_metadata_size, sizeof(std::uint64_t));
+
+    std::size_t payload_size;
+    std::memcpy(
+        &payload_size,
+        msg->data() + original_metadata_size + sizeof(std::uint64_t),
+        sizeof(std::size_t)
+    );
+
+    // Check for termination marker.
+    if (message_id == termination_sentinel_) {
+        peer_expected_[p] = payload_size;  // payload_size carries the count
+        peer_terminated_[p] = true;
+        log->trace(
+            "recv termination from ",
+            peer,
+            " via ",
+            receive_name,
+            " (expected_messages=",
+            payload_size,
+            ")"
+        );
+        return;
+    }
+
+    // Normal application message.
+    peer_received_[p]++;
+
+    std::vector<std::uint8_t> original_metadata(
+        msg->begin(), msg->begin() + safe_cast<std::ptrdiff_t>(original_metadata_size)
+    );
+
+    std::unique_ptr<Buffer> buffer = nullptr;
+    if (payload_size > 0) {
+        buffer = allocate_buffer_fn_(payload_size);
+    }
+
+    auto message = std::make_unique<MetadataPayloadExchange::Message>(
+        peer, std::move(original_metadata), std::move(buffer)
+    );
+
+    log->trace(receive_name, " ", peer, " (message_id=", message_id, ")");
+    incoming_messages_[peer].emplace_back(std::move(message), message_id, payload_size);
 }
 
 std::vector<std::unique_ptr<MetadataPayloadExchange::Message>>

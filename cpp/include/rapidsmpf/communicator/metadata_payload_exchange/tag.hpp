@@ -154,6 +154,39 @@ class TagMetadataPayloadExchange : public MetadataPayloadExchange {
     void receive_metadata();
 
     /**
+     * @brief Check whether all metadata from a peer has been received.
+     *
+     * @param peer Rank of the peer to check.
+     * @return True if that peer's termination marker has been received and all
+     * expected application metadata has been consumed.
+     */
+    [[nodiscard]] bool peer_done(Rank peer) const;
+
+    /**
+     * @brief Check whether it is safe to use wildcard metadata receives.
+     *
+     * Wildcard receives are safe only while no peer is done. After a peer is done,
+     * wildcard receives could consume a message from a future collective reusing
+     * the same tag.
+     *
+     * @return True if wildcard receives are safe.
+     */
+    [[nodiscard]] bool can_recv_any() const;
+
+    /**
+     * @brief Process one metadata message received from a peer.
+     *
+     * @param msg Metadata message bytes.
+     * @param peer Source rank.
+     * @param receive_name Name of the receive path for logging.
+     */
+    void process_metadata_message(
+        std::unique_ptr<std::vector<std::uint8_t>> msg,
+        Rank peer,
+        char const* receive_name
+    );
+
+    /**
      * @brief Setup data receives for incoming messages.
      *
      * @return A vector of completed metadata-only messages.

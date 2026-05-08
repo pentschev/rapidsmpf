@@ -33,7 +33,15 @@ install(
   EXCLUDE_FROM_ALL
 )
 
-add_executable(bench_comm "bench_comm.cpp")
+add_executable(
+  bench_comm
+  "bench_comm.cpp"
+  "utils/dashboard.cpp"
+  "${PROJECT_SOURCE_DIR}/src/topology/json_io.cpp"
+  "${PROJECT_SOURCE_DIR}/src/topology/bandwidth_discovery.cpp"
+  "${PROJECT_SOURCE_DIR}/src/topology/system_enrichment.cpp"
+  "${PROJECT_SOURCE_DIR}/src/topology/topology_viz.cpp"
+)
 set_target_properties(
   bench_comm
   PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RAPIDSMPF_BINARY_DIR}/benchmarks"
@@ -48,9 +56,20 @@ target_compile_options(
   bench_comm PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>"
                      "$<$<COMPILE_LANGUAGE:CUDA>:${RAPIDSMPF_CUDA_FLAGS}>"
 )
+if(NVML_INCLUDE_DIR)
+  target_include_directories(bench_comm PRIVATE ${NVML_INCLUDE_DIR})
+endif()
 target_link_libraries(
-  bench_comm PRIVATE rapidsmpf::rapidsmpf ucxx::ucxx $<TARGET_NAME_IF_EXISTS:MPI::MPI_C>
-                     $<TARGET_NAME_IF_EXISTS:conda_env> maybe_asan bench_utils
+  bench_comm
+  PRIVATE rapidsmpf::rapidsmpf
+          ucxx::ucxx
+          $<TARGET_NAME_IF_EXISTS:MPI::MPI_C>
+          CUDA::nvml
+          $<TARGET_NAME_IF_EXISTS:rapidsmpf_cucascade_internal>
+          $<$<NOT:$<TARGET_EXISTS:rapidsmpf_cucascade_internal>>:cuCascade::cucascade>
+          $<TARGET_NAME_IF_EXISTS:conda_env>
+          maybe_asan
+          bench_utils
 )
 install(
   TARGETS bench_comm

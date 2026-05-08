@@ -5,7 +5,11 @@
 
 
 #include <iostream>
+#include <limits>
+#include <memory>
+#include <string>
 
+#include <getopt.h>
 #include <mpi.h>
 
 #include <rmm/cuda_stream_pool.hpp>
@@ -22,18 +26,21 @@
 #include <rapidsmpf/memory/pinned_memory_resource.hpp>
 #include <rapidsmpf/progress_thread.hpp>
 #include <rapidsmpf/statistics.hpp>
+#include <rapidsmpf/topology/topology_viz.hpp>
 #include <rapidsmpf/utils/string.hpp>
 
 #ifdef RAPIDSMPF_HAVE_CUPTI
 #include <rapidsmpf/cupti.hpp>
 #endif
 
+#include "utils/dashboard.hpp"
 #include "utils/misc.hpp"
 #include "utils/random_data.hpp"
 #include "utils/rmm_utils.hpp"
 
 
 using namespace rapidsmpf;
+namespace dashboard = rapidsmpf::benchmark::dashboard;
 
 class ArgumentParser {
   public:
@@ -51,8 +58,18 @@ class ArgumentParser {
         }
 
         try {
+            static option long_options[] = {
+                {"dashboard", required_argument, nullptr, 'D'},
+                {"dashboard-file", required_argument, nullptr, 'T'},
+                {"help", no_argument, nullptr, 'h'},
+                {nullptr, 0, nullptr, 0}
+            };
             int option;
-            while ((option = getopt(argc, argv, "hC:O:r:w:n:p:m:M:")) != -1) {
+            while ((option = getopt_long(
+                        argc, argv, "hC:O:r:w:n:p:m:M:D:T:", long_options, nullptr
+                    ))
+                   != -1)
+            {
                 switch (option) {
                 case 'h':
                     {
@@ -72,6 +89,13 @@ class ArgumentParser {
                               "(default: pool)\n"
                            << "  -r <num>   Number of runs (default: 1)\n"
                            << "  -w <num>   Number of warmup runs (default: 0)\n"
+                           << "  -D, --dashboard <port>\n"
+                           << "             Enable the live topology dashboard on rank "
+                              "0.\n"
+                           << "             Use 0 to bind an available local port.\n"
+                           << "  -T, --dashboard-file <path>\n"
+                           << "             JSONL event file shared by ranks (default: "
+                           << dashboard::default_event_file() << ")\n"
 #ifdef RAPIDSMPF_HAVE_CUPTI
                            << "  -M <path>  Enable CUPTI memory monitoring and save CSV "
                               "files with given path prefix. For example, /tmp/test will "
@@ -133,6 +157,18 @@ class ArgumentParser {
                 case 'w':
                     parse_integer(num_warmups, optarg);
                     break;
+                case 'D':
+                    enable_dashboard = true;
+                    parse_integer(
+                        dashboard_port,
+                        optarg,
+                        0,
+                        std::numeric_limits<std::uint16_t>::max()
+                    );
+                    break;
+                case 'T':
+                    dashboard_file = std::string{optarg};
+                    break;
 #ifdef RAPIDSMPF_HAVE_CUPTI
                 case 'M':
                     cupti_csv_prefix = std::string{optarg};
@@ -191,6 +227,10 @@ class ArgumentParser {
         if (enable_cupti_monitoring) {
             ss << "  -M " << cupti_csv_prefix << " (CUPTI memory monitoring enabled)\n";
         }
+        if (enable_dashboard) {
+            ss << "  -D " << dashboard_port << " (dashboard port)\n";
+            ss << "  -T " << dashboard_file << " (dashboard event file)\n";
+        }
         comm.logger()->print(ss.str());
     }
 
@@ -203,7 +243,19 @@ class ArgumentParser {
     std::uint64_t num_ops{1};
     bool enable_cupti_monitoring{false};
     std::string cupti_csv_prefix;
+    bool enable_dashboard{false};
+    std::uint16_t dashboard_port{0};
+    std::string dashboard_file{dashboard::default_event_file()};
 };
+
+std::string current_gpu_pci_bus_id() {
+    auto const cur_dev = rmm::get_current_cuda_device().value();
+    std::string pci_bus_id(16, '\0');
+    RAPIDSMPF_CUDA_TRY(
+        cudaDeviceGetPCIBusId(pci_bus_id.data(), pci_bus_id.size(), cur_dev)
+    );
+    return pci_bus_id.substr(0, pci_bus_id.find('\0'));
+}
 
 Duration run(
     std::shared_ptr<Communicator> comm,
@@ -282,6 +334,9 @@ int main(int argc, char** argv) {
 
     // Initialize configuration options from environment variables.
     rapidsmpf::config::Options options{rapidsmpf::config::get_environment_variables()};
+    if (args.enable_dashboard && args.comm_type == "ucxx") {
+        options.insert_if_absent("ucxx_request_attributes", "1");
+    }
 
     // We'll only measure the last run, so start disabled.
     auto stats = rapidsmpf::Statistics::disabled();
@@ -312,6 +367,61 @@ int main(int argc, char** argv) {
     }
 
     auto& log = comm->logger();
+    std::shared_ptr<dashboard::JsonlEventSink> dashboard_sink;
+    std::unique_ptr<dashboard::Server> dashboard_server;
+    auto ucxx_comm = std::dynamic_pointer_cast<rapidsmpf::ucxx::UCXX>(comm);
+    if (args.enable_dashboard) {
+        if (ucxx_comm == nullptr) {
+            if (comm->rank() == 0) {
+                log->print("Dashboard telemetry is supported only with -C ucxx");
+            }
+        } else {
+            dashboard_sink =
+                std::make_shared<dashboard::JsonlEventSink>(args.dashboard_file);
+            if (comm->rank() == 0) {
+                dashboard_sink->clear();
+            }
+            ucxx_comm->barrier();
+
+            if (comm->rank() == 0) {
+                dashboard_server = std::make_unique<dashboard::Server>(
+                    dashboard_sink->path(), args.dashboard_port
+                );
+                log->print("Dashboard: ", dashboard_server->url());
+            }
+
+            ucxx_comm->set_telemetry_callback(
+                [sink =
+                     dashboard_sink](rapidsmpf::ucxx::UCXX::TelemetryEvent const& event) {
+                    sink->publish_transfer(event);
+                }
+            );
+
+            dashboard_sink->publish_rank(
+                comm->rank(),
+                comm->nranks(),
+                dashboard::hostname(),
+                rmm::get_current_cuda_device().value(),
+                current_gpu_pci_bus_id()
+            );
+
+            if (comm->rank() == 0) {
+                try {
+                    rapidsmpf::topology::topology_viz viz;
+                    if (viz.discover()) {
+                        dashboard_sink->publish_topology(viz.to_json(0));
+                    } else {
+                        dashboard_sink->publish_topology_error(
+                            "topology discovery returned false"
+                        );
+                    }
+                } catch (std::exception const& e) {
+                    dashboard_sink->publish_topology_error(e.what());
+                }
+            }
+        }
+    }
+
     rmm::cuda_stream_view stream = cudf::get_default_stream();
     args.pprint(*comm);
     set_current_rmm_resource(args.rmm_mr);
@@ -332,16 +442,13 @@ int main(int argc, char** argv) {
     {
         std::stringstream ss;
         auto const cur_dev = rmm::get_current_cuda_device().value();
-        std::string pci_bus_id(16, '\0');  // Preallocate space for the PCI bus ID
-        RAPIDSMPF_CUDA_TRY(
-            cudaDeviceGetPCIBusId(pci_bus_id.data(), pci_bus_id.size(), cur_dev)
-        );
+        auto const pci_bus_id = current_gpu_pci_bus_id();
         cudaDeviceProp properties;
         RAPIDSMPF_CUDA_TRY(cudaGetDeviceProperties(&properties, 0));
         ss << "Hardware setup: \n";
         ss << "  GPU (" << properties.name << "): \n";
         ss << "    Device number: " << cur_dev << "\n";
-        ss << "    PCI Bus ID: " << pci_bus_id.substr(0, pci_bus_id.find('\0')) << "\n";
+        ss << "    PCI Bus ID: " << pci_bus_id << "\n";
         ss << "    Total Memory: " << format_nbytes(properties.totalGlobalMem, 0) << "\n";
         ss << "  Comm: " << *comm << "\n";
         log->print(ss.str());

@@ -125,15 +125,11 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
 )
-target_include_directories(
-  topology_viz PRIVATE "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
-)
+target_include_directories(topology_viz PRIVATE "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>")
 if(NVML_INCLUDE_DIR)
   target_include_directories(topology_viz PRIVATE ${NVML_INCLUDE_DIR})
 endif()
-target_compile_options(
-  topology_viz PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>"
-)
+target_compile_options(topology_viz PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>")
 target_link_libraries(
   topology_viz
   PRIVATE cuCascade::cucascade

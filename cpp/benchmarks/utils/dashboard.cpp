@@ -151,10 +151,16 @@ body { overflow: hidden; }
 .edge.nvlink { stroke: var(--gpu); stroke-width: 2.4; opacity: .82; }
 .edge.nvlink_fabric { stroke: var(--fabric); stroke-width: 2.1; opacity: .72; }
 .edge.pcie { stroke: var(--switch); stroke-width: 1.7; stroke-dasharray: 9 6; opacity: .66; }
+.edge.infiniband { stroke: #ff8a65; stroke-width: 2.1; opacity: .72; }
 .edge.transfer { stroke: var(--rank); stroke-width: 2.6; opacity: .92; }
 .edge.transfer.cuda_ipc { stroke: #f6c177; }
 .edge.transfer.infiniband { stroke: #ff8a65; }
 .edge.transfer.pcie { stroke: #b889ff; }
+.edge.active { opacity: .98; }
+.edge.nvlink.active { stroke-width: 4.2; }
+.edge.nvlink_fabric.active { stroke-width: 3.8; }
+.edge.pcie.active { stroke-width: 3.2; }
+.edge.infiniband.active { stroke-width: 3.8; }
 .edge.unknown { stroke-dasharray: 4 6; }
 .node rect { stroke: rgba(255,255,255,.24); stroke-width: 1.2; rx: 6; }
 .node text { fill: var(--text); font-size: 11px; text-anchor: middle; dominant-baseline: middle; pointer-events: none; }
@@ -216,6 +222,8 @@ const state = {
   nodes: new Map(),
   edges: new Map(),
   hostFrames: new Map(),
+  rankToGpu: new Map(),
+  rankToHost: new Map(),
   recent: [],
   eventCount: 0,
   totalBytes: 0,
@@ -439,6 +447,7 @@ function processRank(ev) {
   ensureNode(`host:${host}`, 'host', host, {host});
   const rid = `rank:${ev.rank}`;
   ensureNode(rid, 'rank', `R${ev.rank}`, {host, rank: ev.rank, cudaDevice: ev.cuda_device});
+  state.rankToHost.set(ev.rank, host);
   ensureEdge(`contains:${host}:${rid}`, `host:${host}`, rid, 'contains');
   if (ev.gpu_pci_bus_id) {
     const gid = `gpu:${host}:${normPci(ev.gpu_pci_bus_id)}`;
@@ -447,6 +456,7 @@ function processRank(ev) {
       pci: ev.gpu_pci_bus_id,
       visibleDevice: ev.cuda_device
     });
+    state.rankToGpu.set(ev.rank, gid);
     ensureEdge(`rank_gpu:${ev.rank}`, rid, gid, 'rank_gpu');
   }
   markLayoutDirty();
@@ -464,18 +474,154 @@ function transportLabel(transport) {
   if (transport === 'pcie') return 'PCIe';
   return 'Transfer';
 }
+function uniqueEdges(edges) {
+  const seen = new Set();
+  return edges.filter(edge => {
+    if (!edge || seen.has(edge.id)) return false;
+    seen.add(edge.id);
+    return true;
+  });
+}
+function findEdgeByNodes(type, source, target, includeHidden = false) {
+  for (const edge of state.edges.values()) {
+    if (edge.type !== type) continue;
+    if (!includeHidden && edge.attrs?.hidden) continue;
+    if (
+      (edge.source === source && edge.target === target) ||
+      (edge.source === target && edge.target === source)
+    ) {
+      return edge;
+    }
+  }
+  return undefined;
+}
+function endpointEdges(nodeId, type) {
+  return Array.from(state.edges.values()).filter(edge =>
+    edge.type === type &&
+    !edge.attrs?.hidden &&
+    (edge.source === nodeId || edge.target === nodeId)
+  );
+}
+function transferGpus(ev) {
+  return [state.rankToGpu.get(ev.local_rank), state.rankToGpu.get(ev.peer_rank)];
+}
+function pcieRouteForGpus(gpuA, gpuB) {
+  return uniqueEdges([
+    ...endpointEdges(gpuA, 'pcie'),
+    ...endpointEdges(gpuB, 'pcie')
+  ]);
+}
+function cudaIpcRoute(ev) {
+  const [gpuA, gpuB] = transferGpus(ev);
+  if (!gpuA || !gpuB) return [];
+  const direct = findEdgeByNodes('nvlink', gpuA, gpuB);
+  if (direct) return [direct];
+
+  const hostA = state.nodes.get(gpuA)?.attrs?.host;
+  const hostB = state.nodes.get(gpuB)?.attrs?.host;
+  if (hostA && hostA === hostB) {
+    const fabric = state.nodes.get(`fabric:${hostA}:nvlink`);
+    if (fabric) {
+      const fabricEdges = uniqueEdges([
+        findEdgeByNodes('nvlink_fabric', fabric.id, gpuA),
+        findEdgeByNodes('nvlink_fabric', fabric.id, gpuB)
+      ]);
+      if (fabricEdges.length > 0) return fabricEdges;
+    }
+  }
+
+  // CUDA IPC does not traverse PCIe. If no NVLink path is known, keep the
+  // transfer as a logical CUDA IPC edge instead of attributing it to PCIe.
+  return [];
+}
+function parseMlxDevices(ev) {
+  return Array.from(new Set((ev.debug_string || '').match(/mlx5_\d+/g) || []));
+}
+function nicNodesByName(name) {
+  return Array.from(state.nodes.values()).filter(node =>
+    node.type === 'nic' && (node.label === name || node.id.endsWith(`:${name}`))
+  );
+}
+function chooseNicForRank(rank) {
+  const gpu = state.nodes.get(state.rankToGpu.get(rank));
+  const host = gpu?.attrs?.host || state.rankToHost.get(rank);
+  const numa = gpu?.attrs?.numa;
+  const candidates = Array.from(state.nodes.values()).filter(node =>
+    node.type === 'nic' && (!host || node.attrs?.host === host)
+  );
+  candidates.sort((a, b) => {
+    const an = a.attrs?.numa === numa ? 0 : 1;
+    const bn = b.attrs?.numa === numa ? 0 : 1;
+    if (an !== bn) return an - bn;
+    return compareNode(a, b);
+  });
+  return candidates[0];
+}
+function infinibandRoute(ev) {
+  const nics = parseMlxDevices(ev).flatMap(name => nicNodesByName(name));
+  if (nics.length === 0) {
+    const localNic = chooseNicForRank(ev.local_rank);
+    const peerNic = chooseNicForRank(ev.peer_rank);
+    if (localNic) nics.push(localNic);
+    if (peerNic && peerNic.id !== localNic?.id) nics.push(peerNic);
+  }
+
+  const edges = [];
+  for (const nic of nics) {
+    edges.push(...endpointEdges(nic.id, 'pcie'));
+  }
+  if (nics.length >= 2) {
+    for (let i = 0; i < nics.length; i++) {
+      for (let j = i + 1; j < nics.length; j++) {
+        if (nics[i].id === nics[j].id) continue;
+        edges.push(ensureEdge(
+          `infiniband:${nics[i].id}:${nics[j].id}`,
+          nics[i].id,
+          nics[j].id,
+          'infiniband',
+          {transport: 'infiniband'}
+        ));
+      }
+    }
+  }
+  return uniqueEdges(edges);
+}
+function routeTransfer(ev, transport) {
+  if (transport === 'cuda_ipc') return cudaIpcRoute(ev);
+  if (transport === 'pcie') {
+    const [gpuA, gpuB] = transferGpus(ev);
+    if (gpuA && gpuB) return pcieRouteForGpus(gpuA, gpuB);
+  }
+  if (transport === 'infiniband') return infinibandRoute(ev);
+  return [];
+}
+function addTransferToPhysicalEdge(edge, ev, transport) {
+  edge.bytes += ev.bytes || 0;
+  edge.count += 1;
+  edge.recent.push({t: Date.now(), bytes: ev.bytes || 0});
+  edge.attrs.transport = transport;
+}
 function processTransfer(ev) {
   ensureNode(`rank:${ev.local_rank}`, 'rank', `R${ev.local_rank}`, {rank: ev.local_rank});
   ensureNode(`rank:${ev.peer_rank}`, 'rank', `R${ev.peer_rank}`, {rank: ev.peer_rank});
   if (ev.direction !== 'send') return;
   const a = Math.min(ev.local_rank, ev.peer_rank);
   const b = Math.max(ev.local_rank, ev.peer_rank);
-  const edge = ensureEdge(`transfer:${a}:${b}`, `rank:${a}`, `rank:${b}`, 'transfer', {
-    transport: classifyTransfer(ev)
-  });
-  edge.bytes += ev.bytes || 0;
-  edge.count += 1;
-  edge.recent.push({t: Date.now(), bytes: ev.bytes || 0});
+  const transport = classifyTransfer(ev);
+  let mappedEdges = routeTransfer(ev, transport);
+  if (mappedEdges.length === 0) {
+    const [gpuA, gpuB] = transferGpus(ev);
+    mappedEdges = [
+      ensureEdge(
+        `transfer:${transport}:${a}:${b}`,
+        gpuA || `rank:${a}`,
+        gpuB || `rank:${b}`,
+        'transfer',
+        {transport}
+      )
+    ];
+  }
+  for (const edge of mappedEdges) addTransferToPhysicalEdge(edge, ev, transport);
   state.totalBytes += ev.bytes || 0;
   state.recent.push({t: Date.now(), bytes: ev.bytes || 0});
 }
@@ -489,7 +635,7 @@ function processEvent(ev) {
   totalBytesEl.textContent = fmtBytes(state.totalBytes);
 }
 function edgeClass(e) {
-  return `edge ${e.type || ''} ${e.attrs?.transport || ''} ${e.attrs?.confidence || ''}`;
+  return `edge ${e.type || ''} ${e.attrs?.transport || ''} ${e.bytes > 0 ? 'active' : ''} ${e.attrs?.confidence || ''}`;
 }
 function visibleNodes() {
   return Array.from(state.nodes.values()).filter(node => node.type !== 'host');
@@ -914,10 +1060,17 @@ function render() {
     const path = svgEl('path');
     path.setAttribute('class', edgeClass(e));
     path.setAttribute('d', edgePath(e, a, b));
-    if (e.type === 'nvlink' && e.attrs?.bandwidth) path.setAttribute('stroke-width', String(1.8 + Math.min(3.8, e.attrs.bandwidth / 35)));
-    if (e.type === 'transfer') path.setAttribute('stroke-width', String(2.0 + Math.min(6, Math.log2(Math.max(1, e.bytes)) / 5)));
+    if (e.type === 'nvlink' && e.attrs?.bandwidth) {
+      path.setAttribute('stroke-width', String(1.8 + Math.min(3.8, e.attrs.bandwidth / 35) + (e.bytes > 0 ? 1.4 : 0)));
+    }
+    if (e.type === 'pcie' && e.bytes > 0) {
+      path.setAttribute('stroke-width', String(2.4 + Math.min(4, Math.log2(Math.max(1, e.bytes)) / 7)));
+    }
+    if ((e.type === 'transfer' || e.type === 'infiniband' || e.type === 'nvlink_fabric') && e.bytes > 0) {
+      path.setAttribute('stroke-width', String(2.0 + Math.min(6, Math.log2(Math.max(1, e.bytes)) / 5)));
+    }
     edgesLayer.appendChild(path);
-    if (e.type === 'transfer' && e.bytes > 0) {
+    if (e.bytes > 0) {
       e.recent = e.recent.filter(x => now - x.t < 5000);
       e.rate = e.recent.reduce((sum, item) => sum + item.bytes, 0) / 5;
       const label = svgEl('text');

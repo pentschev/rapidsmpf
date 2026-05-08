@@ -180,11 +180,37 @@ bool TagMetadataPayloadExchange::is_idle() const {
 
 void TagMetadataPayloadExchange::receive_metadata() {
     auto const t0 = Clock::now();
+    std::size_t recv_any_probes{0};
+    std::size_t recv_from_probes{0};
+    std::size_t probe_misses{0};
 
-    if (nranks_ == 1) {
+    auto record_stats = [&]() {
+        auto const total_probes = recv_any_probes + recv_from_probes;
+        if (total_probes > 0) {
+            statistics_->add_stat(
+                "metadata-payload-exchange-receive-metadata-probes",
+                static_cast<double>(total_probes)
+            );
+            statistics_->add_stat(
+                "metadata-payload-exchange-receive-metadata-probe-misses",
+                static_cast<double>(probe_misses)
+            );
+            statistics_->add_stat(
+                "metadata-payload-exchange-recv-any-probes",
+                static_cast<double>(recv_any_probes)
+            );
+            statistics_->add_stat(
+                "metadata-payload-exchange-recv-from-probes",
+                static_cast<double>(recv_from_probes)
+            );
+        }
         statistics_->add_duration_stat(
             "metadata-payload-exchange-receive-metadata", Clock::now() - t0
         );
+    };
+
+    if (nranks_ == 1) {
+        record_stats();
         return;
     }
 
@@ -192,11 +218,11 @@ void TagMetadataPayloadExchange::receive_metadata() {
     // outstanding. Once any peer is done, switch to per-peer receives so we never
     // consume that peer's future-exchange metadata on a reused tag.
     while (can_recv_any()) {
+        ++recv_any_probes;
         auto [msg, peer] = comm_->recv_any(metadata_tag_);
         if (!msg) {
-            statistics_->add_duration_stat(
-                "metadata-payload-exchange-receive-metadata", Clock::now() - t0
-            );
+            ++probe_misses;
+            record_stats();
             return;
         }
         process_metadata_message(std::move(msg), peer, "recv_any");
@@ -207,8 +233,10 @@ void TagMetadataPayloadExchange::receive_metadata() {
             continue;
         }
         while (true) {
+            ++recv_from_probes;
             auto msg = comm_->recv_from(peer, metadata_tag_);
             if (!msg) {
+                ++probe_misses;
                 break;
             }
             process_metadata_message(std::move(msg), peer, "recv_from");
@@ -218,9 +246,7 @@ void TagMetadataPayloadExchange::receive_metadata() {
         }
     }
 
-    statistics_->add_duration_stat(
-        "metadata-payload-exchange-receive-metadata", Clock::now() - t0
-    );
+    record_stats();
 }
 
 bool TagMetadataPayloadExchange::peer_done(Rank peer) const {

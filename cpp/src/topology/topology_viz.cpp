@@ -3,8 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include <nvml.h>
 
@@ -18,6 +23,86 @@
 namespace rapidsmpf::topology {
 
 namespace {
+
+std::string read_sysfs_line(std::filesystem::path const& path) {
+    std::ifstream f{path};
+    if (!f.is_open())
+        return {};
+    std::string line;
+    std::getline(f, line);
+    while (!line.empty()
+           && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
+    {
+        line.pop_back();
+    }
+    return line;
+}
+
+int read_numa_node(std::filesystem::path const& device_path) {
+    std::string numa = read_sysfs_line(device_path / "numa_node");
+    if (numa.empty())
+        return -1;
+    try {
+        return std::stoi(numa);
+    } catch (...) {
+        return -1;
+    }
+}
+
+bool has_network_device(
+    system_topology const& topo, std::string const& name, std::string const& pci_bus_id
+) {
+    return std::any_of(
+        topo.network_devices.begin(),
+        topo.network_devices.end(),
+        [&](network_device_info const& dev) {
+            return dev.name == name
+                   || (!pci_bus_id.empty() && dev.pci_bus_id == pci_bus_id);
+        }
+    );
+}
+
+void add_infiniband_devices(system_topology& topo) {
+    namespace fs = std::filesystem;
+    fs::path const ib_dir{"/sys/class/infiniband"};
+    std::error_code ec;
+    if (!fs::exists(ib_dir, ec) || !fs::is_directory(ib_dir, ec)) {
+        return;
+    }
+
+    std::vector<fs::path> devices;
+    for (auto const& entry : fs::directory_iterator{ib_dir, ec}) {
+        if (ec)
+            break;
+        devices.push_back(entry.path());
+    }
+    std::sort(devices.begin(), devices.end());
+
+    for (auto const& path : devices) {
+        std::string name = path.filename().string();
+        if (name.empty())
+            continue;
+
+        fs::path device_path = path / "device";
+        fs::path resolved = fs::canonical(device_path, ec);
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+
+        std::string pci_bus_id = resolved.filename().string();
+        if (has_network_device(topo, name, pci_bus_id))
+            continue;
+
+        network_device_info dev;
+        dev.name = name;
+        dev.pci_bus_id = pci_bus_id;
+        dev.numa_node = read_numa_node(device_path);
+        topo.network_devices.push_back(std::move(dev));
+    }
+
+    topo.num_network_devices = static_cast<int>(topo.network_devices.size());
+}
 
 system_topology convert_from_cucascade(
     cucascade::memory::system_topology_info const& base
@@ -56,6 +141,8 @@ system_topology convert_from_cucascade(
 void enrich_topology(system_topology& topo) {
     // NVML should already be initialized by cuCascade, but ensure it is
     nvmlInit_v2();
+
+    add_infiniband_devices(topo);
 
     for (auto& gpu : topo.gpus) {
         if (gpu.pcie.generation == 0 && !gpu.pci_bus_id.empty()) {

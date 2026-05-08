@@ -15,6 +15,8 @@
 #include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
+#include <rrun/scoped_env_var.hpp>
+
 #include <rapidsmpf/bootstrap/bootstrap.hpp>
 #include <rapidsmpf/bootstrap/ucxx.hpp>
 #include <rapidsmpf/bootstrap/utils.hpp>
@@ -407,6 +409,9 @@ int main(int argc, char** argv) {
 
             if (comm->rank() == 0) {
                 try {
+                    rapidsmpf::rrun::ScopedEnvVar cvd_guard(
+                        "CUDA_VISIBLE_DEVICES", nullptr
+                    );
                     rapidsmpf::topology::topology_viz viz;
                     if (viz.discover()) {
                         dashboard_sink->publish_topology(viz.to_json(0));

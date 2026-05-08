@@ -134,6 +134,8 @@ body { overflow: hidden; }
 .swatch.nvlink { background: var(--gpu); }
 .swatch.pcie { background: var(--switch); }
 .swatch.transfer { background: var(--rank); }
+.swatch.cuda_ipc { background: #f6c177; }
+.swatch.infiniband { background: #ff8a65; }
 .tool { border: 1px solid var(--line); background: #21262d; color: var(--text); border-radius: 6px; padding: 4px 9px; font: inherit; cursor: pointer; }
 .tool:hover { background: #2b3139; }
 #stage { width: 100%; height: 100%; touch-action: none; cursor: grab; }
@@ -150,8 +152,9 @@ body { overflow: hidden; }
 .edge.nvlink_fabric { stroke: var(--fabric); stroke-width: 2.1; opacity: .72; }
 .edge.pcie { stroke: var(--switch); stroke-width: 1.7; stroke-dasharray: 9 6; opacity: .66; }
 .edge.transfer { stroke: var(--rank); stroke-width: 2.6; opacity: .92; }
-.edge.transfer.nvlink { stroke: #f6c177; }
+.edge.transfer.cuda_ipc { stroke: #f6c177; }
 .edge.transfer.infiniband { stroke: #ff8a65; }
+.edge.transfer.pcie { stroke: #b889ff; }
 .edge.unknown { stroke-dasharray: 4 6; }
 .node rect { stroke: rgba(255,255,255,.24); stroke-width: 1.2; rx: 6; }
 .node text { fill: var(--text); font-size: 11px; text-anchor: middle; dominant-baseline: middle; pointer-events: none; }
@@ -164,6 +167,7 @@ body { overflow: hidden; }
 .node.rank rect { fill: #b7642e; }
 .node.unknown rect { fill: #586069; }
 .node.pinned rect { stroke: #ffffff; stroke-width: 1.8; }
+.node.disconnected rect { opacity: .55; stroke-dasharray: 5 4; }
 .label { fill: var(--muted); font-size: 11px; paint-order: stroke; stroke: rgba(11,15,20,.92); stroke-width: 4px; }
 .edge-label { fill: var(--text); font-size: 11px; paint-order: stroke; stroke: rgba(11,15,20,.95); stroke-width: 4px; }
 .empty { fill: var(--muted); font-size: 14px; }
@@ -181,7 +185,8 @@ body { overflow: hidden; }
     <div class="legend">
       <span class="key"><span class="swatch nvlink"></span>NVLink</span>
       <span class="key"><span class="swatch pcie"></span>PCIe</span>
-      <span class="key"><span class="swatch transfer"></span>Transfer</span>
+      <span class="key"><span class="swatch cuda_ipc"></span>CUDA IPC</span>
+      <span class="key"><span class="swatch infiniband"></span>InfiniBand</span>
     </div>
     <button class="tool" id="fitView" type="button">Fit</button>
   </div>
@@ -437,10 +442,10 @@ function processRank(ev) {
   ensureEdge(`contains:${host}:${rid}`, `host:${host}`, rid, 'contains');
   if (ev.gpu_pci_bus_id) {
     const gid = `gpu:${host}:${normPci(ev.gpu_pci_bus_id)}`;
-    ensureNode(gid, 'gpu', `GPU ${ev.cuda_device}`, {
+    ensureNode(gid, 'gpu', `GPU ${shortPci(ev.gpu_pci_bus_id)}`, {
       host,
       pci: ev.gpu_pci_bus_id,
-      gpuId: ev.cuda_device
+      visibleDevice: ev.cuda_device
     });
     ensureEdge(`rank_gpu:${ev.rank}`, rid, gid, 'rank_gpu');
   }
@@ -448,9 +453,16 @@ function processRank(ev) {
 }
 function classifyTransfer(ev) {
   const d = (ev.debug_string || '').toLowerCase();
-  if (d.includes('cuda_ipc') || d.includes('cuda ipc')) return 'nvlink';
+  if (d.includes('cuda_ipc') || d.includes('cuda ipc')) return 'cuda_ipc';
+  if (d.includes('cuda_copy') || d.includes('gdr_copy')) return 'pcie';
   if (d.includes('mlx5') || d.includes('/ib') || d.includes('rc_') || d.includes('dc_')) return 'infiniband';
   return 'unknown';
+}
+function transportLabel(transport) {
+  if (transport === 'cuda_ipc') return 'CUDA IPC';
+  if (transport === 'infiniband') return 'InfiniBand';
+  if (transport === 'pcie') return 'PCIe';
+  return 'Transfer';
 }
 function processTransfer(ev) {
   ensureNode(`rank:${ev.local_rank}`, 'rank', `R${ev.local_rank}`, {rank: ev.local_rank});
@@ -576,10 +588,10 @@ function layoutLine(nodes, y, minX, maxX, idealX) {
     setTarget(sorted[i], x, y);
   }
 }
-function layoutGpuGroup(nodes, centerX, centerY, width) {
+function layoutGpuGroup(nodes, centerX, centerY, width, rowsHint) {
   const sorted = nodes.slice().sort(compareNode);
   if (sorted.length === 0) return;
-  const rows = sorted.length > 4 ? 2 : 1;
+  const rows = rowsHint || (sorted.length > 4 ? 2 : 1);
   const cols = Math.ceil(sorted.length / rows);
   const stepX = cols <= 1 ? 0 : Math.min(140, Math.max(96, width / Math.max(1, cols - 1)));
   const total = stepX * (cols - 1);
@@ -589,6 +601,28 @@ function layoutGpuGroup(nodes, centerX, centerY, width) {
     const col = i % cols;
     const y = centerY + (rows === 1 ? 0 : (row === 0 ? -66 : 66));
     setTarget(sorted[i], x0 + col * stepX, y);
+  }
+}
+function layoutNvlinkMesh(nodes, lanes, centerX, centerY, width, numaValues) {
+  const groups = new Map();
+  for (const gpu of nodes) {
+    const numa = Number.isInteger(gpu.attrs?.numa) ? gpu.attrs.numa : numaValues[0];
+    if (!groups.has(numa)) groups.set(numa, []);
+    groups.get(numa).push(gpu);
+  }
+  if (groups.size <= 1) {
+    layoutGpuGroup(nodes, centerX, centerY, width);
+    return;
+  }
+  const laneWidth = Math.max(180, width / Math.max(1, groups.size));
+  for (const [numa, gpus] of groups.entries()) {
+    layoutGpuGroup(
+      gpus,
+      lanes.get(numa) ?? centerX,
+      centerY,
+      laneWidth * 0.78,
+      gpus.length > 2 ? 2 : 1
+    );
   }
 }
 function connectedTargetX(node, fallbackX) {
@@ -646,7 +680,7 @@ function placeHost(spec) {
       gpus.some(gpu => gpu.id === edge.target)
     )
   ) {
-    layoutGpuGroup(gpus, centerX, gpuY, innerRight - innerLeft);
+    layoutNvlinkMesh(gpus, lanes, centerX, gpuY, innerRight - innerLeft, spec.numa);
   } else {
     const groups = new Map();
     for (const gpu of gpus) {
@@ -813,10 +847,10 @@ function truncate(text, maxLen) {
 function nodeSubtitle(node) {
   if (node.type === 'cpu') return Number.isFinite(node.attrs?.cores) && node.attrs.cores > 0 ? `${node.attrs.cores} cores` : `NUMA ${node.attrs?.numa ?? '?'}`;
   if (node.type === 'gpu') return node.attrs?.pci ? shortPci(node.attrs.pci) : '';
-  if (node.type === 'nic') return node.attrs?.bandwidth ? `${node.attrs.bandwidth} GB/s` : shortPci(node.attrs?.pci);
+  if (node.type === 'nic') return node.attrs?.bandwidth ? `${node.attrs.bandwidth} GB/s` : 'disconnected';
   if (node.type === 'switch') return 'PCIe switch';
   if (node.type === 'fabric') return 'aggregated links';
-  if (node.type === 'rank') return Number.isInteger(node.attrs?.cudaDevice) ? `GPU ${node.attrs.cudaDevice}` : '';
+  if (node.type === 'rank') return 'rank';
   return '';
 }
 function render() {
@@ -890,13 +924,14 @@ function render() {
       label.setAttribute('class', 'edge-label');
       label.setAttribute('x', (a.x + b.x) / 2 + 4);
       label.setAttribute('y', (a.y + b.y) / 2 - 4);
-      label.textContent = `${fmtBytes(e.bytes)} ${fmtBytes(e.rate)}/s`;
+      label.textContent = `${transportLabel(e.attrs?.transport)} ${fmtBytes(e.bytes)} ${fmtBytes(e.rate)}/s`;
       labelsLayer.appendChild(label);
     }
   }
   for (const n of visibleNodes()) {
     const g = svgEl('g');
-    g.setAttribute('class', `node ${n.type || 'unknown'}${n.pinned ? ' pinned' : ''}`);
+    const disconnected = n.type === 'nic' && !(n.attrs?.bandwidth > 0);
+    g.setAttribute('class', `node ${n.type || 'unknown'}${n.pinned ? ' pinned' : ''}${disconnected ? ' disconnected' : ''}`);
     g.setAttribute('transform', `translate(${n.x} ${n.y})`);
     g.dataset.id = n.id;
     const [w, h] = nodeSize(n);

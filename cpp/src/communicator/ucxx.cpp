@@ -4,12 +4,16 @@
  */
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <utility>
 
+#include <ucxx/experimental/worker_builder.h>
 #include <ucxx/request.h>
 
 #include <rapidsmpf/communicator/ucxx.hpp>
@@ -923,6 +927,48 @@ void create_cuda_context_callback(void* /* callbackArg */) {
     cudaFree(nullptr);
 }
 
+bool parse_bool_option(std::string const& value) {
+    if (value.empty()) {
+        return false;
+    }
+    std::string normalized;
+    normalized.reserve(value.size());
+    std::ranges::transform(value, std::back_inserter(normalized), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (normalized == "1" || normalized == "true" || normalized == "yes"
+        || normalized == "on")
+    {
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no"
+        || normalized == "off")
+    {
+        return false;
+    }
+    RAPIDSMPF_FAIL("Invalid boolean option value: " + value, std::invalid_argument);
+}
+
+std::int64_t now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::system_clock::now().time_since_epoch()
+    )
+        .count();
+}
+
+std::string memory_type_name(int memory_type) {
+    switch (memory_type) {
+    case UCS_MEMORY_TYPE_HOST:
+        return "host";
+    case UCS_MEMORY_TYPE_CUDA:
+        return "cuda";
+    case UCS_MEMORY_TYPE_CUDA_MANAGED:
+        return "cuda-managed";
+    default:
+        return "unknown";
+    }
+}
+
 }  // namespace
 
 InitializedRank::InitializedRank(
@@ -952,10 +998,14 @@ std::unique_ptr<rapidsmpf::ucxx::InitializedRank> init(
                 RAPIDSMPF_FAIL("Invalid progress mode");
             }
         });
+    auto request_attributes =
+        options.get<bool>("ucxx_request_attributes", parse_bool_option);
 
-    auto create_worker = [progress_mode]() {
+    auto create_worker = [progress_mode, request_attributes]() {
         auto context = ::ucxx::createContext({}, ::ucxx::Context::defaultFeatureFlags);
-        auto worker = context->createWorker(false);
+        auto worker = ::ucxx::experimental::createWorker(context)
+                          .requestAttributes(request_attributes)
+                          .build();
 
         RAPIDSMPF_EXPECTS(
             progress_mode != ProgressMode::Blocking,
@@ -1146,6 +1196,11 @@ UCXX::UCXX(
     return shared_resources_->nranks();
 }
 
+void UCXX::set_telemetry_callback(TelemetryCallback callback) {
+    std::lock_guard<std::mutex> lock(telemetry_mutex_);
+    telemetry_callback_ = std::move(callback);
+}
+
 constexpr ::ucxx::Tag tag_with_rank(Rank rank, int tag) {
     // The rapidsmpf::ucxx::Communicator API uses 32-bit `int` for user tags to match
     // MPI's standard. We can thus pack the rank in the higher 32-bit of UCX's
@@ -1211,6 +1266,59 @@ std::shared_ptr<::ucxx::Endpoint> UCXX::get_endpoint(Rank rank) {
     }
 }
 
+std::optional<UCXX::TelemetryEvent> UCXX::make_telemetry_event(
+    TelemetryEvent::Direction direction, Rank peer_rank, Tag tag, std::uint64_t bytes
+) {
+    {
+        std::lock_guard<std::mutex> lock(telemetry_mutex_);
+        if (!telemetry_callback_) {
+            return std::nullopt;
+        }
+    }
+
+    TelemetryEvent event;
+    event.local_rank = shared_resources_->rank();
+    event.peer_rank = peer_rank;
+    event.tag = static_cast<Tag::StorageT>(tag);
+    event.direction = direction;
+    event.bytes = bytes;
+    event.start_time_us = now_us();
+    event.memory_type = "unknown";
+    return event;
+}
+
+void UCXX::record_telemetry(Future& future) {
+    if (!future.telemetry_.has_value() || future.telemetry_reported_) {
+        return;
+    }
+    future.telemetry_reported_ = true;
+
+    auto& event = *future.telemetry_;
+    event.end_time_us = now_us();
+    event.duration_seconds =
+        static_cast<double>(event.end_time_us - event.start_time_us) / 1'000'000.0;
+    if (event.duration_seconds < 0) {
+        event.duration_seconds = 0;
+    }
+
+    try {
+        auto attrs = future.req_->getRequestAttributes();
+        event.debug_string = attrs.debugString;
+        event.memory_type = memory_type_name(static_cast<int>(attrs.memoryType));
+    } catch (std::exception const&) {
+        // Request attributes are optional and unavailable for eager/inline requests.
+    }
+
+    TelemetryCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(telemetry_mutex_);
+        callback = telemetry_callback_;
+    }
+    if (callback) {
+        callback(event);
+    }
+}
+
 std::unique_ptr<Communicator::Future> UCXX::send(
     std::unique_ptr<std::vector<std::uint8_t>> msg, Rank rank, Tag tag
 ) {
@@ -1220,7 +1328,10 @@ std::unique_ptr<Communicator::Future> UCXX::send(
         msg->size(),
         tag_with_rank(shared_resources_->rank(), static_cast<int>(tag))
     );
-    return std::make_unique<Future>(req, std::move(msg));
+    auto telemetry = make_telemetry_event(
+        TelemetryEvent::Direction::Send, rank, tag, safe_cast<std::uint64_t>(msg->size())
+    );
+    return std::make_unique<Future>(req, std::move(msg), std::move(telemetry));
 }
 
 std::unique_ptr<Communicator::Future> UCXX::send(
@@ -1231,7 +1342,10 @@ std::unique_ptr<Communicator::Future> UCXX::send(
     auto req = get_endpoint(rank)->tagSend(
         msg->data(), msg->size, tag_with_rank(shared_resources_->rank(), tag)
     );
-    return std::make_unique<Future>(req, std::move(msg));
+    auto telemetry = make_telemetry_event(
+        TelemetryEvent::Direction::Send, rank, tag, safe_cast<std::uint64_t>(msg->size)
+    );
+    return std::make_unique<Future>(req, std::move(msg), std::move(telemetry));
 }
 
 std::unique_ptr<Communicator::Future> UCXX::recv(
@@ -1249,7 +1363,13 @@ std::unique_ptr<Communicator::Future> UCXX::recv(
         tag_with_rank(rank, tag),
         ::ucxx::TagMaskFull
     );
-    return std::make_unique<Future>(req, std::move(recv_buffer));
+    auto telemetry = make_telemetry_event(
+        TelemetryEvent::Direction::Recv,
+        rank,
+        tag,
+        safe_cast<std::uint64_t>(recv_buffer->size)
+    );
+    return std::make_unique<Future>(req, std::move(recv_buffer), std::move(telemetry));
 }
 
 std::unique_ptr<Communicator::Future> UCXX::recv_sync_host_data(
@@ -1264,7 +1384,13 @@ std::unique_ptr<Communicator::Future> UCXX::recv_sync_host_data(
         tag_with_rank(rank, tag),
         ::ucxx::TagMaskFull
     );
-    return std::make_unique<Future>(req, std::move(synced_buffer));
+    auto telemetry = make_telemetry_event(
+        TelemetryEvent::Direction::Recv,
+        rank,
+        tag,
+        safe_cast<std::uint64_t>(synced_buffer->size())
+    );
+    return std::make_unique<Future>(req, std::move(synced_buffer), std::move(telemetry));
 }
 
 std::pair<std::unique_ptr<std::vector<std::uint8_t>>, Rank> UCXX::recv_any(Tag tag) {
@@ -1325,10 +1451,11 @@ UCXX::test_some(std::vector<std::unique_ptr<Communicator::Future>>& future_vecto
     std::vector<std::size_t> indices;
     indices.reserve(future_vector.size());
     for (std::size_t i = 0; i < future_vector.size(); i++) {
-        auto ucxx_future = dynamic_cast<Future const*>(future_vector[i].get());
+        auto ucxx_future = dynamic_cast<Future*>(future_vector[i].get());
         RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
         if (ucxx_future->req_->isCompleted()) {
             ucxx_future->req_->checkError();
+            record_telemetry(*ucxx_future);
             indices.push_back(i);
         } else {
             // We rely on this API returning completed futures in order,
@@ -1364,10 +1491,11 @@ std::vector<std::size_t> UCXX::test_some(
     progress_worker();
     std::vector<std::size_t> completed;
     for (auto const& [key, future] : future_map) {
-        auto ucxx_future = dynamic_cast<Future const*>(future.get());
+        auto ucxx_future = dynamic_cast<Future*>(future.get());
         RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
         if (ucxx_future->req_->isCompleted()) {
             ucxx_future->req_->checkError();
+            record_telemetry(*ucxx_future);
             completed.push_back(key);
         }
     }
@@ -1380,6 +1508,9 @@ bool UCXX::test(std::unique_ptr<Communicator::Future>& future) {
     progress_worker();
     auto flag = ucxx_future->req_->isCompleted();
     ucxx_future->req_->checkError();
+    if (flag) {
+        record_telemetry(*ucxx_future);
+    }
     return flag;
 }
 
@@ -1404,6 +1535,9 @@ std::vector<std::unique_ptr<Buffer>> UCXX::wait_all(
     std::vector<std::unique_ptr<Buffer>> result;
     result.reserve(reqs.size());
     for (auto&& future : futures) {
+        auto ucxx_future = dynamic_cast<Future*>(future.get());
+        RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
+        record_telemetry(*ucxx_future);
         result.push_back(release_data(std::move(future)));
     }
     return result;
@@ -1423,6 +1557,7 @@ std::unique_ptr<Buffer> UCXX::wait(std::unique_ptr<Communicator::Future> future)
         progress_worker();
     }
     ucxx_future->req_->checkError();
+    record_telemetry(*ucxx_future);
     ucxx_future->data_buffer_->unlock();
     return std::move(ucxx_future->data_buffer_);
 }
@@ -1431,6 +1566,10 @@ std::unique_ptr<Buffer> UCXX::release_data(std::unique_ptr<Communicator::Future>
     auto ucxx_future = dynamic_cast<Future*>(future.get());
     RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
     RAPIDSMPF_EXPECTS(ucxx_future->data_buffer_ != nullptr, "future has no data");
+    if (ucxx_future->req_->isCompleted()) {
+        ucxx_future->req_->checkError();
+        record_telemetry(*ucxx_future);
+    }
     ucxx_future->data_buffer_->unlock();
     return std::move(ucxx_future->data_buffer_);
 }
@@ -1441,6 +1580,10 @@ std::unique_ptr<std::vector<std::uint8_t>> UCXX::release_sync_host_data(
     auto ucxx_future = dynamic_cast<Future*>(future.get());
     RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
     RAPIDSMPF_EXPECTS(ucxx_future->synced_host_data_ != nullptr, "future has no data");
+    if (ucxx_future->req_->isCompleted()) {
+        ucxx_future->req_->checkError();
+        record_telemetry(*ucxx_future);
+    }
     return std::move(ucxx_future->synced_host_data_);
 }
 
@@ -1478,7 +1621,11 @@ std::shared_ptr<UCXX> UCXX::split() {
     auto context = shared_resources_->get_context();
 
     // Create a new worker using the same context
-    auto worker = context->createWorker(false);
+    auto request_attributes =
+        options_.get<bool>("ucxx_request_attributes", parse_bool_option);
+    auto worker = ::ucxx::experimental::createWorker(context)
+                      .requestAttributes(request_attributes)
+                      .build();
     worker->setProgressThreadStartCallback(create_cuda_context_callback, nullptr);
     worker->startProgressThread(true);
 

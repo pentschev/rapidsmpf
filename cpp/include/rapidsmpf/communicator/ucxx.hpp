@@ -4,8 +4,13 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <utility>
 
 #include <ucxx/api.h>
@@ -112,6 +117,59 @@ std::unique_ptr<rapidsmpf::ucxx::InitializedRank> init(
 class UCXX final : public Communicator {
   public:
     /**
+     * @brief Request-level telemetry reported when a UCXX send or receive completes.
+     *
+     * Events are emitted only when a telemetry callback is installed with
+     * `set_telemetry_callback()`. Timing starts when RapidsMPF posts the UCXX request
+     * and ends when RapidsMPF observes the request completion. UCXX transport details
+     * are populated from UCXX request attributes when those attributes are available.
+     */
+    struct TelemetryEvent {
+        /**
+         * @brief Direction of the completed UCXX operation.
+         */
+        enum class Direction : std::uint8_t {
+            /**
+             * @brief A send request completed.
+             */
+            Send = 0,
+            /**
+             * @brief A receive request completed.
+             */
+            Recv
+        };
+
+        /** @brief Rank that observed the request completion. */
+        Rank local_rank{0};
+        /** @brief Peer rank specified when the send or receive request was posted. */
+        Rank peer_rank{0};
+        /** @brief RapidsMPF tag associated with the completed request. */
+        Tag::StorageT tag{0};
+        /** @brief Whether the completed request was a send or receive. */
+        Direction direction{Direction::Send};
+        /** @brief Number of payload bytes requested by the operation. */
+        std::uint64_t bytes{0};
+        /** @brief Request post timestamp in microseconds since the Unix epoch. */
+        std::int64_t start_time_us{0};
+        /** @brief Request completion timestamp in microseconds since the Unix epoch. */
+        std::int64_t end_time_us{0};
+        /** @brief Elapsed time between request post and observed completion, in seconds.
+         */
+        double duration_seconds{0};
+        /** @brief Memory type reported by UCXX request attributes, or empty if
+         * unavailable. */
+        std::string memory_type;
+        /** @brief UCXX request debug string, or empty if request attributes are
+         * unavailable. */
+        std::string debug_string;
+    };
+
+    /**
+     * @brief Callback type used to consume completed UCXX request telemetry events.
+     */
+    using TelemetryCallback = std::function<void(TelemetryEvent const&)>;
+
+    /**
      * @brief Represents the future result of an UCXX operation.
      *
      * This class is used to handle the result of an UCXX communication operation
@@ -126,9 +184,16 @@ class UCXX final : public Communicator {
          *
          * @param req The UCXX request handle for the operation.
          * @param data_buffer A unique pointer to the data buffer.
+         * @param telemetry Optional request telemetry metadata to report on completion.
          */
-        Future(std::shared_ptr<::ucxx::Request> req, std::unique_ptr<Buffer> data_buffer)
-            : req_{std::move(req)}, data_buffer_{std::move(data_buffer)} {}
+        Future(
+            std::shared_ptr<::ucxx::Request> req,
+            std::unique_ptr<Buffer> data_buffer,
+            std::optional<TelemetryEvent> telemetry = std::nullopt
+        )
+            : req_{std::move(req)},
+              data_buffer_{std::move(data_buffer)},
+              telemetry_{std::move(telemetry)} {}
 
         /**
          * @brief Construct a Future from synchronized host data.
@@ -138,12 +203,16 @@ class UCXX final : public Communicator {
          *
          * @param req The UCXX request handle for the operation.
          * @param synced_host_data A unique pointer to a vector containing host memory.
+         * @param telemetry Optional request telemetry metadata to report on completion.
          */
         Future(
             std::shared_ptr<::ucxx::Request> req,
-            std::unique_ptr<std::vector<std::uint8_t>> synced_host_data
+            std::unique_ptr<std::vector<std::uint8_t>> synced_host_data,
+            std::optional<TelemetryEvent> telemetry = std::nullopt
         )
-            : req_{std::move(req)}, synced_host_data_{std::move(synced_host_data)} {}
+            : req_{std::move(req)},
+              synced_host_data_{std::move(synced_host_data)},
+              telemetry_{std::move(telemetry)} {}
 
         ~Future() noexcept override = default;
 
@@ -152,6 +221,8 @@ class UCXX final : public Communicator {
         std::unique_ptr<Buffer> data_buffer_;
         // Dedicated storage for host data that is valid at the time of construction.
         std::unique_ptr<std::vector<std::uint8_t>> synced_host_data_;
+        std::optional<TelemetryEvent> telemetry_;
+        bool telemetry_reported_{false};
     };
 
     /**
@@ -181,6 +252,16 @@ class UCXX final : public Communicator {
      * @copydoc Communicator::nranks
      */
     [[nodiscard]] Rank nranks() const override;
+
+    /**
+     * @brief Install a callback invoked once per completed UCXX send/recv future.
+     *
+     * Passing an empty callback disables telemetry publishing. This API is UCXX-specific
+     * because MPI does not expose equivalent request-level transport debug attributes.
+     *
+     * @param callback Callback invoked from the thread that observes request completion.
+     */
+    void set_telemetry_callback(TelemetryCallback callback);
 
     /**
      * @copydoc Communicator::send
@@ -340,9 +421,15 @@ class UCXX final : public Communicator {
     config::Options options_;
     std::shared_ptr<Logger> logger_;
     std::shared_ptr<ProgressThread> progress_thread_;
+    std::mutex telemetry_mutex_;
+    TelemetryCallback telemetry_callback_;
 
     std::shared_ptr<::ucxx::Endpoint> get_endpoint(Rank rank);
     void progress_worker();
+    [[nodiscard]] std::optional<TelemetryEvent> make_telemetry_event(
+        TelemetryEvent::Direction direction, Rank peer_rank, Tag tag, std::uint64_t bytes
+    );
+    void record_telemetry(Future& future);
 };
 
 }  // namespace ucxx

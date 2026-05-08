@@ -4,13 +4,13 @@
 
 from __future__ import annotations
 
+from rapidsmpf.communicator.communicator import _available_communicators
+
 # Ensure ucxx Python module is imported so its __init__ runs and
 # loads libucxx_python.so (required when installed via pip).
 # The ucxx.pyx bindings only use `cimport`, so the Python module
 # is otherwise never imported and its initialization is skipped.
 import ucxx  # noqa: F401
-
-from rapidsmpf.communicator.communicator import _available_communicators
 
 COMMUNICATORS = _available_communicators()
 """Tuple of available communicators.

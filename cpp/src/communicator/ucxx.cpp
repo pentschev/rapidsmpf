@@ -1301,7 +1301,7 @@ void UCXX::record_telemetry(Future& future) {
     }
 
     try {
-        auto attrs = future.req_->getRequestAttributes();
+        auto attrs = future.req_->queryAttributes();
         event.debug_string = attrs.debugString;
         event.memory_type = memory_type_name(static_cast<int>(attrs.memoryType));
     } catch (std::exception const&) {

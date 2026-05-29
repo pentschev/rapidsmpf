@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 from mpi4py import MPI
 
-import cudf
+import pylibcudf as plc
 import rmm.mr
 from pylibcudf.contiguous_split import pack
 from rmm.pylibrmm.stream import DEFAULT_STREAM
@@ -21,38 +21,37 @@ import rapidsmpf.bootstrap
 import rapidsmpf.communicator.mpi
 from rapidsmpf.config import Options, get_environment_variables
 from rapidsmpf.memory.buffer import MemoryType
-from rapidsmpf.memory.buffer_resource import BufferResource, LimitAvailableMemory
+from rapidsmpf.memory.buffer_resource import BufferResource
 from rapidsmpf.memory.packed_data import PackedData
 from rapidsmpf.progress_thread import ProgressThread
 from rapidsmpf.rmm_resource_adaptor import RmmResourceAdaptor
 from rapidsmpf.shuffler import Shuffler
 from rapidsmpf.statistics import Statistics
-from rapidsmpf.utils.cudf import cudf_to_pylibcudf_table
 from rapidsmpf.utils.string import format_bytes, parse_bytes
 
 if TYPE_CHECKING:
     from rapidsmpf.communicator.communicator import Communicator
 
 
-def generate_partition(size_bytes: int) -> cudf.DataFrame:
+def generate_partition(size_bytes: int) -> plc.Table:
     """
     Generate a random partition of data.
 
     Parameters
     ----------
     size_bytes
-        size of the dataframe in bytes
+        size of the table in bytes
 
     Returns
     -------
-    cudf.DataFrame
+    plc.Table
     """
     n_rows = size_bytes // 8  # each row is 8 bytes
-    return cudf.DataFrame(
-        {
-            "id": cp.arange(0, n_rows, dtype=cp.int32),
-            "value": cp.arange(0, n_rows, dtype=cp.float32),
-        }
+    return plc.Table(
+        [
+            plc.Column.from_array(cp.arange(0, n_rows, dtype=cp.int32)),
+            plc.Column.from_array(cp.arange(0, n_rows, dtype=cp.float32)),
+        ]
     )
 
 
@@ -151,7 +150,7 @@ def streaming_shuffle(
 
     # simulate a hash partition by splitting a partition into total_num_partitions
     split_size = part_size // output_nparts
-    dummy_table = cudf_to_pylibcudf_table(generate_partition(split_size))
+    dummy_table = generate_partition(split_size)
 
     comm.logger.print(f"num local partitions:{n_parts_local} split size:{split_size}")
     for p in range(n_parts_local):
@@ -257,12 +256,10 @@ def setup_and_run(args: argparse.Namespace) -> None:
 
     # Create a buffer resource that limits device memory if `--spill-device`
     # is not None.
-    memory_available = (
-        None
-        if args.spill_device is None
-        else {MemoryType.DEVICE: LimitAvailableMemory(mr, limit=args.spill_device)}
+    memory_limits = (
+        None if args.spill_device is None else {MemoryType.DEVICE: args.spill_device}
     )
-    br = BufferResource(mr, memory_available=memory_available, statistics=stats)
+    br = BufferResource(mr, memory_limits=memory_limits, statistics=stats)
 
     args.out_nparts = args.out_nparts if args.out_nparts is not None else comm.nranks
     args.part_size = args.part_size if args.part_size is not None else args.local_size

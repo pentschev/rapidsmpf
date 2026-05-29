@@ -4,23 +4,20 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
-import cudf
+import pylibcudf as plc
 from pylibcudf.contiguous_split import pack
 
 from rapidsmpf.coll import AllGather
 from rapidsmpf.integrations.cudf.partition import unpack_and_concat
 from rapidsmpf.memory.buffer_resource import BufferResource
 from rapidsmpf.memory.packed_data import PackedData
-from rapidsmpf.statistics import Statistics
-from rapidsmpf.utils.cudf import (
-    cudf_to_pylibcudf_table,
-    pylibcudf_to_cudf_dataframe,
-)
+from rapidsmpf.testing import assert_eq
 
 if TYPE_CHECKING:
     import rmm.mr
@@ -55,8 +52,8 @@ def generate_packed_data(
     """
     # Generate sequential integers starting from offset
     values = np.arange(offset, offset + n_elements, dtype=np.int32)
-    df = cudf.DataFrame({"data": values})
-    packed_columns = pack(cudf_to_pylibcudf_table(df))
+    table = plc.Table([plc.Column.from_array(values, stream=stream)])
+    packed_columns = pack(table, stream=stream)
     return PackedData.from_cudf_packed_columns(packed_columns, stream, br)
 
 
@@ -71,8 +68,8 @@ def validate_packed_data(
     Validate a packed data object by checking its contents.
 
     For now, this is a simplified validation that just checks we can
-    convert the packed data back to a cuDF table and that it has the
-    expected number of rows.
+    convert the packed data back to a pylibcudf table and that it has
+    the expected number of rows.
 
     Parameters
     ----------
@@ -91,21 +88,24 @@ def validate_packed_data(
         If the data doesn't match expectations
     """
     # unpack_and_concat expects a list of PackedData
-    plc_table = unpack_and_concat([packed_data], stream, br)
-    result_df = pylibcudf_to_cudf_dataframe(plc_table)
+    result_table = unpack_and_concat([packed_data], stream, br)
 
     # Verify the row count matches expected
-    assert len(result_df) == n_elements
+    assert result_table.num_rows() == n_elements
 
     if n_elements > 0:
         # Basic validation - check that we have the expected structure
-        assert len(result_df.columns) == 1
+        assert result_table.num_columns() == 1
 
-        # Convert to numpy for validation
-        result_values = result_df[result_df.columns[0]].to_numpy()
-        expected_values = np.arange(offset, offset + n_elements, dtype=np.int32)
-
-        np.testing.assert_array_equal(result_values, expected_values)
+        expected_table = plc.Table(
+            [
+                plc.Column.from_array(
+                    np.arange(offset, offset + n_elements, dtype=np.int32),
+                    stream=stream,
+                )
+            ]
+        )
+        assert_eq(result_table, expected_table)
 
 
 def gen_offset(i: int, r: int) -> int:
@@ -116,6 +116,9 @@ def gen_offset(i: int, r: int) -> int:
 @pytest.mark.parametrize("n_elements", [0, 1, 10, 100])
 @pytest.mark.parametrize("n_inserts", [0, 1, 10])
 @pytest.mark.parametrize("ordered", [False, True])
+@pytest.mark.parametrize(
+    "use_context_manager", [True, False], ids=["context", "non-context"]
+)
 def test_basic_allgather(
     comm: Communicator,
     device_mr: rmm.mr.CudaMemoryResource,
@@ -123,6 +126,7 @@ def test_basic_allgather(
     n_elements: int,
     n_inserts: int,
     ordered: bool,  # noqa: FBT001
+    use_context_manager: bool,  # noqa: FBT001
 ) -> None:
     """
     Test basic AllGather functionality.
@@ -132,28 +136,26 @@ def test_basic_allgather(
     should receive all data from all ranks.
     """
     br = BufferResource(device_mr)
-    statistics = Statistics(enable=False)
 
     # Create AllGather instance
     allgather = AllGather(
         comm=comm,
-        op_id=0,  # Use operation ID 0
+        op_id=0,
         br=br,
-        statistics=statistics,
     )
 
-    this_rank = comm.rank
     n_ranks = comm.nranks
+    this_rank = comm.rank
 
-    # Insert data from this rank
-    for i in range(n_inserts):
-        packed_data = generate_packed_data(
-            n_elements, gen_offset(i, this_rank), stream, br
-        )
-        allgather.insert(i, packed_data)
-
-    # Mark this rank as finished
-    allgather.insert_finished()
+    cm = allgather if use_context_manager else nullcontext(allgather)
+    with cm as ag:
+        for i in range(n_inserts):
+            packed_data = generate_packed_data(
+                n_elements, gen_offset(i, this_rank), stream, br
+            )
+            ag.insert(i, packed_data)
+    if not use_context_manager:
+        allgather.insert_finished()
 
     # Wait for completion and extract results
     results = allgather.wait_and_extract(ordered=ordered)
@@ -186,8 +188,22 @@ def test_basic_allgather(
             for result in results:
                 # Use our validation function with dummy offset (we can't easily extract the real offset)
                 # This will at least verify the structure and size
-                from rapidsmpf.integrations.cudf.partition import unpack_and_concat
+                result_table = unpack_and_concat([result], stream, br)
+                assert result_table.num_rows() == n_elements
 
-                plc_table = unpack_and_concat([result], stream, br)
-                result_df = pylibcudf_to_cudf_dataframe(plc_table)
-                assert len(result_df) == n_elements
+
+def test_insert_finished_raises_in_context(
+    comm: Communicator,
+    device_mr: rmm.mr.CudaMemoryResource,
+) -> None:
+    """Test that insert_finished raises when called inside a context manager."""
+    br = BufferResource(device_mr)
+    ag = AllGather(comm=comm, op_id=0, br=br)
+    with (
+        ag,
+        pytest.raises(
+            ValueError, match=r"Cannot call insert_finished.*within a context"
+        ),
+    ):
+        ag.insert_finished()
+    ag.wait_and_extract(ordered=True)

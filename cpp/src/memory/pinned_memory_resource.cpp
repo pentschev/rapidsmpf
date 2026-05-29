@@ -10,6 +10,7 @@
 
 #include <rmm/resource_ref.hpp>
 
+#include <rapidsmpf/config.hpp>
 #include <rapidsmpf/error.hpp>
 #include <rapidsmpf/memory/pinned_memory_resource.hpp>
 #include <rapidsmpf/utils/misc.hpp>
@@ -73,39 +74,24 @@ std::optional<PinnedMemoryResource> PinnedMemoryResource::make_if_available(
 std::optional<PinnedMemoryResource> PinnedMemoryResource::from_options(
     config::Options options
 ) {
-    bool const pinned_memory = options.get<bool>("pinned_memory", [](auto const& s) {
-        return parse_string<bool>(s.empty() ? "True" : s);
-    });
+    bool const pinned_memory = options.get<bool>("pinned_memory", parse_string<bool>);
+
     if (pinned_memory && is_pinned_memory_resources_supported()) {
+        auto const host_memory_per_gpu = get_host_memory_per_gpu();
+        auto const total = safe_cast<double>(host_memory_per_gpu);
         PinnedPoolProperties pool_properties{
             .initial_pool_size = options.get<size_t>(
                 "pinned_initial_pool_size",
-                [](auto const& s) { return s.empty() ? 0 : parse_nbytes_unsigned(s); }
+                [total](auto const& s) { return parse_nbytes_or_percent(s, total); }
             ),
             .max_pool_size = options.get<std::optional<size_t>>(
-                "pinned_max_pool_size", [](auto const& s) -> std::optional<size_t> {
-                    auto parsed = parse_optional(s);
-                    if (parsed.has_value() && !parsed->empty()) {
-                        return parse_nbytes_unsigned(*parsed);
-                    }
-                    return std::nullopt;
-                }
+                "pinned_max_pool_size",
+                [total](auto const& s) { return parse_nbytes_or_percent(s, total); }
             )
         };
         return PinnedMemoryResource{get_current_numa_node(), std::move(pool_properties)};
     }
     return PinnedMemoryResource::Disabled;
-}
-
-std::function<std::int64_t()> PinnedMemoryResource::get_memory_available_cb() const {
-    auto const max_pool_size = pool_properties_.max_pool_size.value_or(0);
-    if (max_pool_size > 0) {
-        auto const limit = safe_cast<std::int64_t>(max_pool_size);
-        return [tracker = *this, limit]() {
-            return limit - tracker.get().current_allocated();
-        };
-    }
-    return std::numeric_limits<std::int64_t>::max;
 }
 
 }  // namespace rapidsmpf

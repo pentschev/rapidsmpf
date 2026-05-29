@@ -5,7 +5,6 @@
 #pragma once
 
 #include <cstddef>
-#include <functional>
 #include <memory>
 
 #include <cuda.h>
@@ -118,9 +117,17 @@ class PinnedMemoryResource final
     /**
      * @brief Construct from configuration options.
      *
-     * @param options Configuration options.
+     * Recognized options:
+     * - "pinned_memory": enable pinned memory.
+     * - "pinned_initial_pool_size" (bytes or percentage): initial pool size.
+     *   - Byte values (e.g. "1 MiB") are applied literally.
+     *   - Percentages (e.g. "10%") are relative to `get_host_memory_per_gpu()`.
+     * - "pinned_max_pool_size" (bytes, percentage, or disabled): maximum pool size.
+     *   - Byte and percentages uses the same parsing rules as "pinned_initial_pool_size".
+     *   - A disabled value (e.g. "off") leaves the pool unbounded.
      *
-     * @return A `PinnedMemoryResource` if pinned memory is enabled and supported,
+     * @param options Configuration options.
+     * @return A `PinnedMemoryResource` if pinned memory is enabled and supported;
      * otherwise `std::nullopt`.
      */
     static std::optional<PinnedMemoryResource> from_options(config::Options options);
@@ -198,15 +205,6 @@ class PinnedMemoryResource final
     [[nodiscard]] constexpr PinnedPoolProperties const& properties() const noexcept {
         return pool_properties_;
     }
-
-    /**
-     * @brief Returns a memory-availability callback for the pinned pool, if the pool has
-     * a configured maximum size.
-     *
-     * @return A callable `std::int64_t()`. If no maximum pool size is configured, returns
-     * `std::numeric_limits<std::int64_t>::%max` (unbounded).
-     */
-    [[nodiscard]] std::function<std::int64_t()> get_memory_available_cb() const;
 
     /**
      * @brief Enables the `cuda::mr::host_accessible` property.

@@ -28,6 +28,7 @@
 #include <rapidsmpf/streaming/core/context.hpp>
 #include <rapidsmpf/streaming/cudf/partition.hpp>
 #include <rapidsmpf/streaming/cudf/table_chunk.hpp>
+#include <rapidsmpf/utils/misc.hpp>
 #include <rapidsmpf/utils/string.hpp>
 
 #include "../utils/misc.hpp"
@@ -263,14 +264,17 @@ rapidsmpf::Duration run(
     std::vector<rapidsmpf::streaming::Actor> actors;
     {
         auto ch1 = ctx->create_channel();
+        auto const num_columns = rapidsmpf::safe_cast<cudf::size_type>(args.num_columns);
+        auto const num_local_rows =
+            rapidsmpf::safe_cast<cudf::size_type>(args.num_local_rows);
         actors.push_back(
             rapidsmpf::streaming::actor::random_table_generator(
                 ctx,
                 stream,
                 ch1,
                 args.num_local_partitions,
-                static_cast<cudf::size_type>(args.num_columns),
-                static_cast<cudf::size_type>(args.num_local_rows),
+                num_columns,
+                num_local_rows,
                 min_val,
                 max_val
             )
@@ -355,15 +359,12 @@ int main(int argc, char** argv) {
 
     set_current_rmm_resource(args.rmm_mr);
     auto stat_enabled_mr = set_device_mem_resource_with_stats();
-    std::unordered_map<rapidsmpf::MemoryType, rapidsmpf::BufferResource::MemoryAvailable>
-        memory_available{};
+    std::unordered_map<rapidsmpf::MemoryType, std::int64_t> memory_limits{};
     if (args.device_mem_limit_mb >= 0) {
-        memory_available[rapidsmpf::MemoryType::DEVICE] = rapidsmpf::LimitAvailableMemory{
-            stat_enabled_mr, args.device_mem_limit_mb << 20
-        };
+        memory_limits[rapidsmpf::MemoryType::DEVICE] = args.device_mem_limit_mb << 20;
     }
 
-    auto stats = std::make_shared<rapidsmpf::Statistics>(/* enable = */ true);
+    auto stats = rapidsmpf::Statistics::create();
 
     auto pinned_mr = args.pinned_mem_disable
                          ? rapidsmpf::PinnedMemoryResource::Disabled
@@ -371,7 +372,7 @@ int main(int argc, char** argv) {
     auto br = std::make_shared<rapidsmpf::BufferResource>(
         stat_enabled_mr,
         pinned_mr,
-        std::move(memory_available),
+        std::move(memory_limits),
         std::nullopt,
         std::make_shared<rmm::cuda_stream_pool>(
             16, rmm::cuda_stream::flags::non_blocking
@@ -457,14 +458,15 @@ int main(int argc, char** argv) {
         log.print(ss.str());
     }
 
+    auto statistics = ctx->statistics();
     if (args.enable_memory_profiler) {
-        log.print(ctx->statistics()->report({
+        log.print(statistics->report({
             .mr = stat_enabled_mr,
             .pinned_mr = pinned_mr,
             .header = "Statistics (of the last run):",
         }));
     } else {
-        log.print(ctx->statistics()->report({.header = "Statistics (of the last run):"}));
+        log.print(statistics->report({.header = "Statistics (of the last run):"}));
     }
 
     if (!use_bootstrap) {

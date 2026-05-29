@@ -244,7 +244,7 @@ Shuffler::Shuffler(
                     comm_,
                     op_id,
                     [this](std::size_t size) -> std::unique_ptr<Buffer> {
-                        return br_->allocate(
+                        return br_->make_buffer(
                             br_->stream_pool().get_stream(),
                             br_->reserve_or_fail(size, MEMORY_TYPES)
                         );
@@ -352,7 +352,7 @@ void Shuffler::insert(std::unordered_map<PartID, PackedData>&& chunks) {
         }
 
         // Check if we should spill the chunk before inserting into the inbox.
-        std::int64_t const headroom = br_->memory_available(MemoryType::DEVICE)();
+        std::int64_t const headroom = br_->memory_available(MemoryType::DEVICE);
         if (headroom < 0 && packed_data.data) {
             auto reservation =
                 br_->reserve_or_fail(packed_data.data->size, SPILL_TARGET_MEMORY_TYPES);
@@ -441,7 +441,7 @@ std::size_t Shuffler::spill(std::optional<std::size_t> amount) {
     if (amount.has_value()) {
         spill_need = amount.value();
     } else {
-        std::int64_t const headroom = br_->memory_available(MemoryType::DEVICE)();
+        std::int64_t const headroom = br_->memory_available(MemoryType::DEVICE);
         if (headroom < 0) {
             spill_need = safe_cast<std::size_t>(std::abs(headroom));
         }

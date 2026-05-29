@@ -504,71 +504,41 @@ TEST(OptionsTest, PinnedMemoryResourceFromOptionsDisabledWhenSetToFalse) {
     EXPECT_FALSE(pmr.has_value());
 }
 
-TEST(OptionsTest, PinnedMemoryResourceFromOptionsEnabledByDefault) {
+TEST(OptionsTest, PinnedMemoryResourceFromOptionsDisabledByDefault) {
     Options opts;  // Empty options
 
     auto pmr = PinnedMemoryResource::from_options(opts);
 
-    if (is_pinned_memory_resources_supported()) {
-        EXPECT_NE(pmr, PinnedMemoryResource::Disabled);
-        EXPECT_TRUE(pmr.has_value());
-    } else {
-        EXPECT_EQ(pmr, PinnedMemoryResource::Disabled);
-        EXPECT_FALSE(pmr.has_value());
-    }
+    EXPECT_EQ(pmr, PinnedMemoryResource::Disabled);
+    EXPECT_FALSE(pmr.has_value());
 }
 
-TEST(OptionsTest, MemoryAvailableFromOptionsCreatesMapWithDeviceLimit) {
+TEST(OptionsTest, DeviceLimitFromOptionsReturnsConfiguredLimit) {
     std::unordered_map<std::string, std::string> strings = {
         {"spill_device_limit", "1GiB"}
     };
     Options opts(strings);
 
-    rmm::mr::cuda_memory_resource cuda_mr;
-    RmmResourceAdaptor mr{cuda_mr};
-    auto mem_available = memory_available_from_options(mr, opts);
-
-    // Should contain a DEVICE entry
-    ASSERT_TRUE(mem_available.find(MemoryType::DEVICE) != mem_available.end());
-
-    // Should return the configured limit (1 GiB)
-    auto available = mem_available[MemoryType::DEVICE]();
-    EXPECT_EQ(available, 1_GiB);
+    EXPECT_EQ(device_limit_from_options(opts), static_cast<std::int64_t>(1_GiB));
 }
 
-TEST(OptionsTest, MemoryAvailableFromOptionsUsesPercentageOfTotalMemory) {
+TEST(OptionsTest, DeviceLimitFromOptionsParsesPercentageOfTotalMemory) {
     std::unordered_map<std::string, std::string> strings = {
         {"spill_device_limit", "50%"}
     };
     Options opts(strings);
 
-    rmm::mr::cuda_memory_resource cuda_mr;
-    RmmResourceAdaptor mr{cuda_mr};
-    auto mem_available = memory_available_from_options(mr, opts);
-
-    ASSERT_TRUE(mem_available.find(MemoryType::DEVICE) != mem_available.end());
-
-    // Should return 50% of total device memory
     auto [_, total_mem] = rmm::available_device_memory();
     auto expected = rmm::align_down(total_mem / 2, rmm::CUDA_ALLOCATION_ALIGNMENT);
-    auto available = mem_available[MemoryType::DEVICE]();
-    EXPECT_EQ(available, expected);
+    EXPECT_EQ(device_limit_from_options(opts), static_cast<std::int64_t>(expected));
 }
 
-TEST(OptionsTest, MemoryAvailableFromOptionsUsesDefaultWhenNotSet) {
+TEST(OptionsTest, DeviceLimitFromOptionsUsesDefaultWhenNotSet) {
     Options opts;  // Empty options
 
-    rmm::mr::cuda_memory_resource cuda_mr;
-    RmmResourceAdaptor mr{cuda_mr};
-    auto mem_available = memory_available_from_options(mr, opts);
-
-    ASSERT_TRUE(mem_available.find(MemoryType::DEVICE) != mem_available.end());
-
-    // Should use default of 80%
     auto [_, total_mem] = rmm::available_device_memory();
     auto expected = rmm::align_down(total_mem * 4 / 5, rmm::CUDA_ALLOCATION_ALIGNMENT);
-    auto available = mem_available[MemoryType::DEVICE]();
-    EXPECT_EQ(available, expected);
+    EXPECT_EQ(device_limit_from_options(opts), static_cast<std::int64_t>(expected));
 }
 
 TEST(OptionsTest, PeriodicSpillCheckFromOptionsParsesMilliseconds) {
@@ -653,12 +623,11 @@ TEST(OptionsTest, BufferResourceFromOptionsCreatesInstanceWithExplicitOptions) {
 
     rmm::mr::cuda_memory_resource cuda_mr;
     RmmResourceAdaptor mr{cuda_mr};
-    auto br = BufferResource::from_options(mr, opts);
+    auto br = BufferResource::from_options(mr, opts, Statistics::from_options(opts));
 
     EXPECT_TRUE(br->statistics()->enabled());
     EXPECT_EQ(br->stream_pool().get_pool_size(), 8);
-    auto mem_avail = br->memory_available(MemoryType::DEVICE);
-    EXPECT_EQ(mem_avail(), 1_GiB);
+    EXPECT_EQ(br->memory_available(MemoryType::DEVICE), 1_GiB);
 }
 
 TEST(OptionsTest, BufferResourceFromOptionsUsesDefaultWhenOptionsEmpty) {
@@ -671,8 +640,7 @@ TEST(OptionsTest, BufferResourceFromOptionsUsesDefaultWhenOptionsEmpty) {
     EXPECT_EQ(br->stream_pool().get_pool_size(), 16);
     auto [_, total_mem] = rmm::available_device_memory();
     auto expected = rmm::align_down(total_mem * 4 / 5, rmm::CUDA_ALLOCATION_ALIGNMENT);
-    auto mem_avail = br->memory_available(MemoryType::DEVICE);
-    EXPECT_EQ(mem_avail(), expected);
+    EXPECT_EQ(br->memory_available(MemoryType::DEVICE), expected);
 }
 
 TEST(OptionsTest, BufferResourceFromOptionsEnablesStatisticsWhenRequested) {
@@ -681,7 +649,7 @@ TEST(OptionsTest, BufferResourceFromOptionsEnablesStatisticsWhenRequested) {
 
     rmm::mr::cuda_memory_resource cuda_mr;
     RmmResourceAdaptor mr{cuda_mr};
-    auto br = BufferResource::from_options(mr, opts);
+    auto br = BufferResource::from_options(mr, opts, Statistics::from_options(opts));
 
     EXPECT_TRUE(br->statistics()->enabled());
 }
@@ -699,8 +667,7 @@ TEST(OptionsTest, BufferResourceFromOptionsAcceptsPercentageForDeviceLimit) {
     // Verify device memory limit is 50% of total
     auto [_, total_mem] = rmm::available_device_memory();
     auto expected = rmm::align_down(total_mem / 2, rmm::CUDA_ALLOCATION_ALIGNMENT);
-    auto mem_avail = br->memory_available(MemoryType::DEVICE);
-    EXPECT_EQ(mem_avail(), expected);
+    EXPECT_EQ(br->memory_available(MemoryType::DEVICE), expected);
 }
 
 TEST(OptionsTest, BufferResourceFromOptionsEnablesPinnedMemoryWhenSupported) {
@@ -731,7 +698,9 @@ TEST(OptionsTest, ContextFromOptionsCreatesInstanceWithExplicitOptions) {
     RmmResourceAdaptor mr{cuda_mr};
     auto comm =
         std::make_shared<Single>(opts, std::make_shared<rapidsmpf::ProgressThread>());
-    auto ctx = streaming::Context::from_options(mr, comm->logger(), opts);
+    auto ctx = streaming::Context::from_options(
+        mr, comm->logger(), opts, Statistics::from_options(opts)
+    );
 
     ASSERT_NE(ctx, nullptr);
     EXPECT_TRUE(ctx->statistics()->enabled());
@@ -760,7 +729,9 @@ TEST(OptionsTest, ContextFromOptionsEnablesStatisticsWhenRequested) {
     RmmResourceAdaptor mr{cuda_mr};
     auto comm =
         std::make_shared<Single>(opts, std::make_shared<rapidsmpf::ProgressThread>());
-    auto ctx = streaming::Context::from_options(mr, comm->logger(), opts);
+    auto ctx = streaming::Context::from_options(
+        mr, comm->logger(), opts, Statistics::from_options(opts)
+    );
 
     ASSERT_NE(ctx, nullptr);
     EXPECT_TRUE(ctx->statistics()->enabled());

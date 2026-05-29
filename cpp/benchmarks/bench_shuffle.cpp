@@ -23,6 +23,7 @@
 #include <rapidsmpf/progress_thread.hpp>
 #include <rapidsmpf/shuffler/shuffler.hpp>
 #include <rapidsmpf/statistics.hpp>
+#include <rapidsmpf/utils/misc.hpp>
 #include <rapidsmpf/utils/string.hpp>
 
 #ifdef RAPIDSMPF_HAVE_CUPTI
@@ -373,28 +374,23 @@ std::vector<InputPartitionsT> generate_input_partitions(
     rapidsmpf::BufferResource* br,
     TransformFn&& transform_fn
 ) {
+    auto const num_columns = rapidsmpf::safe_cast<cudf::size_type>(args.num_columns);
+    auto const num_local_rows =
+        rapidsmpf::safe_cast<cudf::size_type>(args.num_local_rows);
     std::int32_t const min_val = 0;
-    std::int32_t const max_val = args.num_local_rows;
+    std::int32_t const max_val = num_local_rows;
 
     std::vector<InputPartitionsT> input_partitions;
     input_partitions.reserve(args.num_local_partitions);
     for (rapidsmpf::shuffler::PartID i = 0; i < args.num_local_partitions; ++i) {
-        std::size_t size_lb = random_table_size_lower_bound(
-            static_cast<cudf::size_type>(args.num_columns),
-            static_cast<cudf::size_type>(args.num_local_rows)
-        );
+        std::size_t size_lb = random_table_size_lower_bound(num_columns, num_local_rows);
 
         // reserve at least size_lb and spill if necessary.
         auto res = br->reserve_device_memory_and_spill(
             size_lb, args.input_data_allow_overbooking
         );
         cudf::table table = random_table(
-            static_cast<cudf::size_type>(args.num_columns),
-            static_cast<cudf::size_type>(args.num_local_rows),
-            min_val,
-            max_val,
-            stream,
-            br->device_mr()
+            num_columns, num_local_rows, min_val, max_val, stream, br->device_mr()
         );
         input_partitions.emplace_back(transform_fn(std::move(table)));
     }
@@ -542,15 +538,12 @@ int main(int argc, char** argv) {
     set_current_rmm_resource(args.rmm_mr);
     rapidsmpf::RmmResourceAdaptor stat_enabled_mr = set_device_mem_resource_with_stats();
 
-    std::unordered_map<rapidsmpf::MemoryType, rapidsmpf::BufferResource::MemoryAvailable>
-        memory_available{};
+    std::unordered_map<rapidsmpf::MemoryType, std::int64_t> memory_limits{};
     if (args.device_mem_limit_mb >= 0) {
-        memory_available[rapidsmpf::MemoryType::DEVICE] = rapidsmpf::LimitAvailableMemory{
-            stat_enabled_mr, args.device_mem_limit_mb << 20
-        };
+        memory_limits[rapidsmpf::MemoryType::DEVICE] = args.device_mem_limit_mb << 20;
     }
 
-    auto stats = std::make_shared<rapidsmpf::Statistics>(/* enable = */ true);
+    auto stats = rapidsmpf::Statistics::create();
 
     // We're only going to measure the last run, so disable initially.
     stats->disable();
@@ -558,7 +551,7 @@ int main(int argc, char** argv) {
         stat_enabled_mr,
         args.pinned_mem_disable ? rapidsmpf::PinnedMemoryResource::Disabled
                                 : rapidsmpf::PinnedMemoryResource::make_if_available(),
-        std::move(memory_available),
+        std::move(memory_limits),
         std::chrono::milliseconds{1},
         std::make_shared<rmm::cuda_stream_pool>(
             16, rmm::cuda_stream::flags::non_blocking

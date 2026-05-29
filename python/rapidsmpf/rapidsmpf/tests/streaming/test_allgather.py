@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -22,7 +23,6 @@ from rapidsmpf.testing import assert_eq
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
-    from concurrent.futures import ThreadPoolExecutor
 
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.streaming.core.actor import CppActor
@@ -72,7 +72,7 @@ def test_allgather_actor(context: Context, comm: Communicator) -> None:
 
     actor, deferred = pull_from_channel(context, ch2)
     actors.append(actor)
-    run_actor_network(actors=actors)
+    run_actor_network(context, actors=actors)
 
     result = unpack_and_concat(
         (
@@ -123,12 +123,16 @@ async def allgather_and_concat(
     ch_in: Channel[PackedDataChunk],
     ch_out: Channel[TableChunk],
     op_id: int,
+    use_context_manager: bool,  # noqa: FBT001
 ) -> None:
     gather = AllGather(context, comm, op_id)
-    while (msg := await ch_in.recv(context)) is not None:
-        chunk = PackedDataChunk.from_message(msg, br=context.br()).to_packed_data()
-        gather.insert(msg.sequence_number, chunk)
-    gather.insert_finished()
+    cm = gather if use_context_manager else nullcontext(gather)
+    with cm as ag:
+        while (msg := await ch_in.recv(context)) is not None:
+            chunk = PackedDataChunk.from_message(msg, br=context.br()).to_packed_data()
+            ag.insert(msg.sequence_number, chunk)
+    if not use_context_manager:
+        gather.insert_finished()
     gathered = await gather.extract_all(context, ordered=True)
     stream = context.get_stream_from_pool()
     table = unpack_and_concat(gathered, stream, context.br())
@@ -139,8 +143,13 @@ async def allgather_and_concat(
     await ch_out.drain(context)
 
 
+@pytest.mark.parametrize(
+    "use_context_manager", [True, False], ids=["context", "non-context"]
+)
 def test_allgather_object_interface(
-    context: Context, comm: Communicator, py_executor: ThreadPoolExecutor
+    context: Context,
+    comm: Communicator,
+    use_context_manager: bool,  # noqa: FBT001
 ) -> None:
     if comm.nranks != 1:
         pytest.skip("Only support single-rank runs")
@@ -152,12 +161,14 @@ def test_allgather_object_interface(
     num_chunks = 10
     op_id = 0
     actors.append(generate_inputs(context, ch_in, num_rows, num_chunks))
-    actors.append(allgather_and_concat(context, comm, ch_in, ch_out, op_id))
+    actors.append(
+        allgather_and_concat(context, comm, ch_in, ch_out, op_id, use_context_manager)
+    )
 
     actor, deferred = pull_from_channel(context, ch_out)
     actors.append(actor)
 
-    run_actor_network(actors=actors, py_executor=py_executor)
+    run_actor_network(context, actors=actors)
     (result_msg,) = deferred.release()
     result = TableChunk.from_message(result_msg, br=context.br())
     expect = plc.Table(

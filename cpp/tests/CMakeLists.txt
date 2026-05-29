@@ -82,6 +82,7 @@ target_sources(
           test_cupti_monitor.cpp
           test_error_macros.cpp
           test_host_buffer.cpp
+          test_memory_resources.cpp
           test_metadata_payload_exchange.cpp
           test_misc.cpp
           test_partition.cpp
@@ -143,7 +144,7 @@ if(RAPIDSMPF_HAVE_MPI)
     PRIVATE rapidsmpf::rapidsmpf
             GTest::gmock
             GTest::gtest
-            $<TARGET_NAME_IF_EXISTS:MPI::MPI_C>
+            $<TARGET_NAME_IF_EXISTS:MPI::MPI_CXX>
             $<TARGET_NAME_IF_EXISTS:conda_env>
             maybe_asan
             test_sources
@@ -176,7 +177,7 @@ if(RAPIDSMPF_HAVE_MPI)
               GTest::gmock
               GTest::gtest
               ucxx::ucxx
-              $<TARGET_NAME_IF_EXISTS:MPI::MPI_C>
+              $<TARGET_NAME_IF_EXISTS:MPI::MPI_CXX>
               $<TARGET_NAME_IF_EXISTS:conda_env>
               maybe_asan
               test_sources
@@ -208,7 +209,7 @@ target_compile_options(
 )
 target_link_libraries(
   rrun_tests
-  PRIVATE rapidsmpf::rapidsmpf cuCascade::cucascade GTest::gmock GTest::gtest
+  PRIVATE rapidsmpf::rapidsmpf cuCascade::cucascade_topology_discovery GTest::gmock GTest::gtest
           $<TARGET_NAME_IF_EXISTS:conda_env> maybe_asan $<$<BOOL:${RAPIDSMPF_HAVE_NUMA}>:numa>
 )
 disable_sign_conversion_warning(rrun_tests)
@@ -250,7 +251,6 @@ add_executable(
   "${PROJECT_SOURCE_DIR}/src/bootstrap/bootstrap.cpp"
   "${PROJECT_SOURCE_DIR}/src/bootstrap/file_backend.cpp"
   "${PROJECT_SOURCE_DIR}/src/bootstrap/utils.cpp"
-  "${PROJECT_SOURCE_DIR}/src/system_info.cpp"
   "$<$<BOOL:${RAPIDSMPF_HAVE_SLURM}>:${PROJECT_SOURCE_DIR}/src/bootstrap/slurm_backend.cpp>"
 )
 set_target_properties(

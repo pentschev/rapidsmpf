@@ -79,10 +79,7 @@ default_role = "any"
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
-    "dask-cuda": ("https://docs.rapids.ai/api/dask-cuda/stable/", None),
     "cudf": ("https://docs.rapids.ai/api/cudf/stable/", None),
-    "dask": ("https://docs.dask.org/en/stable/", None),
-    "distributed": ("https://distributed.dask.org/en/stable/", None),
     "ray": ("https://docs.ray.io/en/latest/", None),
 }
 
@@ -144,8 +141,6 @@ def setup(app):
 
 
 nitpick_ignore_regex = [
-    # Cython turns __call__ into a slot_wrapper that autodoc doesn't understand.
-    ("py:obj", "rapidsmpf.memory.buffer_resource.LimitAvailableMemory.__call__"),
     # We're subclassing this from RMM, and sphinx can't find these methods.
     ("py:obj", "rapidsmpf.rmm_resource_adaptor.RmmResourceAdaptor.allocate"),
     ("py:obj", "rapidsmpf.rmm_resource_adaptor.RmmResourceAdaptor.deallocate"),

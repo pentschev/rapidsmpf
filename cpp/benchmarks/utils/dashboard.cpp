@@ -134,7 +134,6 @@ body { overflow: hidden; }
 .swatch.nvlink { background: var(--gpu); }
 .swatch.pcie { background: var(--switch); }
 .swatch.transfer { background: var(--rank); }
-.swatch.cuda_ipc { background: #f6c177; }
 .swatch.infiniband { background: #ff8a65; }
 .tool { border: 1px solid var(--line); background: #21262d; color: var(--text); border-radius: 6px; padding: 4px 9px; font: inherit; cursor: pointer; }
 .tool:hover { background: #2b3139; }
@@ -153,7 +152,6 @@ body { overflow: hidden; }
 .edge.pcie { stroke: var(--switch); stroke-width: 1.7; stroke-dasharray: 9 6; opacity: .66; }
 .edge.infiniband { stroke: #ff8a65; stroke-width: 2.1; opacity: .72; }
 .edge.transfer { stroke: var(--rank); stroke-width: 2.6; opacity: .92; }
-.edge.transfer.cuda_ipc { stroke: #f6c177; }
 .edge.transfer.infiniband { stroke: #ff8a65; }
 .edge.transfer.pcie { stroke: #b889ff; }
 .edge.active { opacity: .98; }
@@ -189,9 +187,8 @@ body { overflow: hidden; }
     <div class="stat" id="status">connecting</div>
     <div class="spacer"></div>
     <div class="legend">
-      <span class="key"><span class="swatch nvlink"></span>NVLink</span>
+      <span class="key"><span class="swatch nvlink"></span>CUDA IPC</span>
       <span class="key"><span class="swatch pcie"></span>PCIe</span>
-      <span class="key"><span class="swatch cuda_ipc"></span>CUDA IPC</span>
       <span class="key"><span class="swatch infiniband"></span>InfiniBand</span>
     </div>
     <button class="tool" id="fitView" type="button">Fit</button>
@@ -358,22 +355,12 @@ function ensureEdge(id, source, target, type, attrs = {}) {
   edge.attrs = {...edge.attrs, ...attrs};
   return edge;
 }
-function maybeBundleDenseNvlinkFabric(host, gpuIds) {
+function keepDirectNvlinkEdgesVisible(gpuIds) {
   const gpuSet = new Set(gpuIds.values());
-  const gpuCount = gpuSet.size;
-  if (gpuCount < 6) return;
   const nvlinks = Array.from(state.edges.values()).filter(edge =>
     edge.type === 'nvlink' && gpuSet.has(edge.source) && gpuSet.has(edge.target)
   );
-  const possible = gpuCount * (gpuCount - 1) / 2;
-  const dense = possible > 0 && nvlinks.length / possible >= 0.65;
-  for (const edge of nvlinks) edge.attrs.hidden = dense;
-  if (!dense) return;
-  const fabricId = `fabric:${host}:nvlink`;
-  ensureNode(fabricId, 'fabric', 'NVLink fabric', {host});
-  for (const gpuId of gpuSet) {
-    ensureEdge(`nvlink_fabric:${host}:${gpuId}`, fabricId, gpuId, 'nvlink_fabric');
-  }
+  for (const edge of nvlinks) edge.attrs.hidden = false;
 }
 function processTopology(topo) {
   const host = topo.system?.hostname || topo.hostname || 'host';
@@ -439,7 +426,7 @@ function processTopology(topo) {
     }
     for (const nic of sw.nic_names || []) ensureEdge(`pcie:${host}:${sw.pci_bus_id}:${nic}`, sid, `nic:${host}:${nic}`, 'pcie');
   }
-  maybeBundleDenseNvlinkFabric(host, gpuIds);
+  keepDirectNvlinkEdgesVisible(gpuIds);
   markLayoutDirty();
 }
 function processRank(ev) {
@@ -482,19 +469,6 @@ function uniqueEdges(edges) {
     return true;
   });
 }
-function findEdgeByNodes(type, source, target, includeHidden = false) {
-  for (const edge of state.edges.values()) {
-    if (edge.type !== type) continue;
-    if (!includeHidden && edge.attrs?.hidden) continue;
-    if (
-      (edge.source === source && edge.target === target) ||
-      (edge.source === target && edge.target === source)
-    ) {
-      return edge;
-    }
-  }
-  return undefined;
-}
 function endpointEdges(nodeId, type) {
   return Array.from(state.edges.values()).filter(edge =>
     edge.type === type &&
@@ -511,28 +485,38 @@ function pcieRouteForGpus(gpuA, gpuB) {
     ...endpointEdges(gpuB, 'pcie')
   ]);
 }
+function shortestEdgePath(source, target, type) {
+  if (source === target) return [];
+  const seen = new Set([source]);
+  const previous = new Map();
+  const queue = [source];
+  for (let head = 0; head < queue.length; head++) {
+    const nodeId = queue[head];
+    for (const edge of state.edges.values()) {
+      if (edge.type !== type || edge.attrs?.hidden) continue;
+      const next = edge.source === nodeId ? edge.target : edge.target === nodeId ? edge.source : undefined;
+      if (!next || seen.has(next)) continue;
+      seen.add(next);
+      previous.set(next, {node: nodeId, edge});
+      if (next === target) {
+        const path = [];
+        for (let cur = target; cur !== source;) {
+          const step = previous.get(cur);
+          if (!step) return [];
+          path.push(step.edge);
+          cur = step.node;
+        }
+        return path.reverse();
+      }
+      queue.push(next);
+    }
+  }
+  return [];
+}
 function cudaIpcRoute(ev) {
   const [gpuA, gpuB] = transferGpus(ev);
   if (!gpuA || !gpuB) return [];
-  const direct = findEdgeByNodes('nvlink', gpuA, gpuB);
-  if (direct) return [direct];
-
-  const hostA = state.nodes.get(gpuA)?.attrs?.host;
-  const hostB = state.nodes.get(gpuB)?.attrs?.host;
-  if (hostA && hostA === hostB) {
-    const fabric = state.nodes.get(`fabric:${hostA}:nvlink`);
-    if (fabric) {
-      const fabricEdges = uniqueEdges([
-        findEdgeByNodes('nvlink_fabric', fabric.id, gpuA),
-        findEdgeByNodes('nvlink_fabric', fabric.id, gpuB)
-      ]);
-      if (fabricEdges.length > 0) return fabricEdges;
-    }
-  }
-
-  // CUDA IPC does not traverse PCIe. If no NVLink path is known, keep the
-  // transfer as a logical CUDA IPC edge instead of attributing it to PCIe.
-  return [];
+  return shortestEdgePath(gpuA, gpuB, 'nvlink');
 }
 function parseMlxDevices(ev) {
   return Array.from(new Set((ev.debug_string || '').match(/mlx5_\d+/g) || []));
@@ -609,7 +593,7 @@ function processTransfer(ev) {
   const b = Math.max(ev.local_rank, ev.peer_rank);
   const transport = classifyTransfer(ev);
   let mappedEdges = routeTransfer(ev, transport);
-  if (mappedEdges.length === 0) {
+  if (mappedEdges.length === 0 && transport !== 'cuda_ipc') {
     const [gpuA, gpuB] = transferGpus(ev);
     mappedEdges = [
       ensureEdge(

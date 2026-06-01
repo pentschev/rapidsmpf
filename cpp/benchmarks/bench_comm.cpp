@@ -4,10 +4,12 @@
  */
 
 
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <getopt.h>
 #include <mpi.h>
@@ -63,12 +65,13 @@ class ArgumentParser {
             static option long_options[] = {
                 {"dashboard", required_argument, nullptr, 'D'},
                 {"dashboard-file", required_argument, nullptr, 'T'},
+                {"dashboard-start-delay", required_argument, nullptr, 'S'},
                 {"help", no_argument, nullptr, 'h'},
                 {nullptr, 0, nullptr, 0}
             };
             int option;
             while ((option = getopt_long(
-                        argc, argv, "hC:O:r:w:n:p:m:M:D:T:", long_options, nullptr
+                        argc, argv, "hC:O:r:w:n:p:m:M:D:T:S:", long_options, nullptr
                     ))
                    != -1)
             {
@@ -98,6 +101,9 @@ class ArgumentParser {
                            << "  -T, --dashboard-file <path>\n"
                            << "             JSONL event file shared by ranks (default: "
                            << dashboard::default_event_file() << ")\n"
+                           << "  -S, --dashboard-start-delay <seconds>\n"
+                           << "             Delay before transfers when the dashboard is "
+                              "enabled (default: 30, use 0 to disable)\n"
 #ifdef RAPIDSMPF_HAVE_CUPTI
                            << "  -M <path>  Enable CUPTI memory monitoring and save CSV "
                               "files with given path prefix. For example, /tmp/test will "
@@ -171,6 +177,9 @@ class ArgumentParser {
                 case 'T':
                     dashboard_file = std::string{optarg};
                     break;
+                case 'S':
+                    parse_integer(dashboard_start_delay_seconds, optarg);
+                    break;
 #ifdef RAPIDSMPF_HAVE_CUPTI
                 case 'M':
                     cupti_csv_prefix = std::string{optarg};
@@ -232,6 +241,8 @@ class ArgumentParser {
         if (enable_dashboard) {
             ss << "  -D " << dashboard_port << " (dashboard port)\n";
             ss << "  -T " << dashboard_file << " (dashboard event file)\n";
+            ss << "  -S " << dashboard_start_delay_seconds
+               << " (dashboard start delay seconds)\n";
         }
         comm.logger()->print(ss.str());
     }
@@ -248,6 +259,7 @@ class ArgumentParser {
     bool enable_dashboard{false};
     std::uint16_t dashboard_port{0};
     std::string dashboard_file{dashboard::default_event_file()};
+    std::uint64_t dashboard_start_delay_seconds{30};
 };
 
 std::string current_gpu_pci_bus_id() {
@@ -393,14 +405,6 @@ int main(int argc, char** argv) {
                 log->print("Dashboard: ", dashboard_server->url());
             }
 
-            dashboard_batcher =
-                std::make_shared<dashboard::TelemetryBatcher>(dashboard_sink);
-            ucxx_comm->set_telemetry_callback(
-                [batcher = dashboard_batcher](
-                    rapidsmpf::ucxx::UCXX::TelemetryEvent const& event
-                ) { batcher->ingest(event); }
-            );
-
             dashboard_sink->publish_rank(
                 comm->rank(),
                 comm->nranks(),
@@ -426,6 +430,31 @@ int main(int argc, char** argv) {
                     dashboard_sink->publish_topology_error(e.what());
                 }
             }
+
+            ucxx_comm->barrier();
+            if (args.dashboard_start_delay_seconds > 0) {
+                if (comm->rank() == 0) {
+                    log->print(
+                        "Dashboard start delay: ",
+                        args.dashboard_start_delay_seconds,
+                        " seconds"
+                    );
+                }
+                std::this_thread::sleep_for(
+                    std::chrono::seconds{static_cast<std::chrono::seconds::rep>(
+                        args.dashboard_start_delay_seconds
+                    )}
+                );
+            }
+            ucxx_comm->barrier();
+
+            dashboard_batcher =
+                std::make_shared<dashboard::TelemetryBatcher>(dashboard_sink);
+            ucxx_comm->set_telemetry_callback(
+                [batcher = dashboard_batcher](
+                    rapidsmpf::ucxx::UCXX::TelemetryEvent const& event
+                ) { batcher->ingest(event); }
+            );
         }
     }
 

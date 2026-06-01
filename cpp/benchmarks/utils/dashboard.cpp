@@ -5,17 +5,22 @@
 
 #include "dashboard.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -94,6 +99,86 @@ std::string direction_string(rapidsmpf::ucxx::UCXX::TelemetryEvent::Direction di
         return "recv";
     }
     return "unknown";
+}
+
+using TelemetryEvent = rapidsmpf::ucxx::UCXX::TelemetryEvent;
+
+void append_transfer_fields(
+    std::ostringstream& ss, TelemetryEvent const& event, std::uint64_t count = 0
+) {
+    ss << "\"local_rank\":" << event.local_rank << ",\"peer_rank\":" << event.peer_rank
+       << ",\"tag\":" << event.tag
+       << ",\"direction\":" << json_string(direction_string(event.direction))
+       << ",\"bytes\":" << event.bytes << ",\"start_time_us\":" << event.start_time_us
+       << ",\"end_time_us\":" << event.end_time_us
+       << ",\"duration_seconds\":" << event.duration_seconds
+       << ",\"memory_type\":" << json_string(event.memory_type)
+       << ",\"debug_string\":" << json_string(event.debug_string);
+    if (count > 0) {
+        ss << ",\"count\":" << count;
+    }
+}
+
+std::string transfer_json(TelemetryEvent const& event) {
+    std::ostringstream ss;
+    ss << "{\"type\":\"transfer\",";
+    append_transfer_fields(ss, event);
+    ss << "}";
+    return ss.str();
+}
+
+std::string lower_copy(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char c : value) {
+        auto const uc = static_cast<unsigned char>(c);
+        out.push_back(static_cast<char>(std::tolower(uc)));
+    }
+    return out;
+}
+
+std::string normalized_debug_key(std::string_view debug_string) {
+    auto const lower = lower_copy(debug_string);
+    if (lower.find("cuda_ipc") != std::string::npos
+        || lower.find("cuda ipc") != std::string::npos)
+    {
+        return "cuda_ipc";
+    }
+    if (lower.find("cuda_copy") != std::string::npos
+        || lower.find("gdr_copy") != std::string::npos)
+    {
+        return "pcie";
+    }
+
+    std::vector<std::string> mlx_devices;
+    std::size_t pos = 0;
+    while ((pos = lower.find("mlx5_", pos)) != std::string::npos) {
+        auto end = pos + std::string_view{"mlx5_"}.size();
+        while (end < lower.size() && std::isdigit(static_cast<unsigned char>(lower[end])))
+        {
+            ++end;
+        }
+        mlx_devices.push_back(lower.substr(pos, end - pos));
+        pos = end;
+    }
+    if (!mlx_devices.empty()) {
+        std::sort(mlx_devices.begin(), mlx_devices.end());
+        mlx_devices.erase(
+            std::unique(mlx_devices.begin(), mlx_devices.end()), mlx_devices.end()
+        );
+        std::ostringstream ss;
+        ss << "infiniband";
+        for (auto const& device : mlx_devices) {
+            ss << ' ' << device;
+        }
+        return ss.str();
+    }
+    if (lower.find("/ib") != std::string::npos || lower.find("rc_") != std::string::npos
+        || lower.find("dc_") != std::string::npos)
+    {
+        return "infiniband";
+    }
+    return std::string{debug_string};
 }
 
 char const* index_html() {
@@ -183,7 +268,7 @@ body { overflow: hidden; }
     <div class="title">RapidsMPF topology dashboard</div>
     <div class="stat">events <strong id="eventCount">0</strong></div>
     <div class="stat">transfer <strong id="totalBytes">0 B</strong></div>
-    <div class="stat">request avg <strong id="windowRate">0 B/s</strong></div>
+    <div class="stat">active avg <strong id="windowRate">0 B/s</strong></div>
     <div class="stat" id="status">connecting</div>
     <div class="spacer"></div>
     <div class="legend">
@@ -225,6 +310,7 @@ const state = {
   eventCount: 0,
   totalBytes: 0,
   latestEventTimeUs: 0,
+  latestEventWallTimeMs: 0,
   view: {x: 0, y: 0, k: 1},
   dragging: null,
   panning: null,
@@ -453,8 +539,8 @@ function processRank(ev) {
 function classifyTransfer(ev) {
   const d = (ev.debug_string || '').toLowerCase();
   if (d.includes('cuda_ipc') || d.includes('cuda ipc')) return 'cuda_ipc';
-  if (d.includes('cuda_copy') || d.includes('gdr_copy')) return 'pcie';
-  if (d.includes('mlx5') || d.includes('/ib') || d.includes('rc_') || d.includes('dc_')) return 'infiniband';
+  if (d.includes('cuda_copy') || d.includes('gdr_copy') || d.includes('pcie')) return 'pcie';
+  if (d.includes('infiniband') || d.includes('mlx5') || d.includes('/ib') || d.includes('rc_') || d.includes('dc_')) return 'infiniband';
   return 'unknown';
 }
 function transportLabel(transport) {
@@ -502,16 +588,30 @@ function eventDurationSeconds(ev) {
   }
   return 0;
 }
+function eventStartUs(ev) {
+  const start = Number(ev.start_time_us);
+  if (Number.isFinite(start) && start > 0) return start;
+  const duration = eventDurationSeconds(ev);
+  return eventEndUs(ev) - duration * 1_000_000;
+}
 function transferSample(ev) {
   return {
+    start: eventStartUs(ev),
     t: eventEndUs(ev),
     bytes: ev.bytes || 0,
     duration: eventDurationSeconds(ev)
   };
 }
 function rateFromSamples(samples) {
+  if (samples.length === 0) return 0;
   const bytes = samples.reduce((sum, item) => sum + item.bytes, 0);
-  const seconds = samples.reduce((sum, item) => sum + item.duration, 0);
+  const start = Math.min(...samples.map(item => item.start));
+  const end = Math.max(...samples.map(item => item.t));
+  const activeSeconds = Number.isFinite(start) && Number.isFinite(end) && end > start
+    ? (end - start) / 1_000_000
+    : 0;
+  const fallbackSeconds = samples.reduce((sum, item) => sum + item.duration, 0);
+  const seconds = activeSeconds > 0 ? activeSeconds : fallbackSeconds;
   return seconds > 0 ? bytes / seconds : 0;
 }
 function shortestEdgePath(source, target, type) {
@@ -638,13 +738,22 @@ function processTransfer(ev) {
   state.totalBytes += ev.bytes || 0;
   const sample = transferSample(ev);
   state.recent.push(sample);
-  state.latestEventTimeUs = Math.max(state.latestEventTimeUs || 0, sample.t);
+  if (sample.t >= (state.latestEventTimeUs || 0)) {
+    state.latestEventTimeUs = sample.t;
+    state.latestEventWallTimeMs = Date.now();
+  }
 }
 function processEvent(ev) {
   state.eventCount++;
   if (ev.type === 'topology') processTopology(ev.topology);
   else if (ev.type === 'rank') processRank(ev);
   else if (ev.type === 'transfer') processTransfer(ev);
+  else if (ev.type === 'transfer_batch') {
+    const events = Array.isArray(ev.events) ? ev.events : [];
+    const count = events.reduce((sum, item) => sum + Math.max(1, Number(item.count) || 1), 0);
+    state.eventCount += Math.max(0, count - 1);
+    for (const item of events) processTransfer(item);
+  }
   else if (ev.type === 'topology_error') statusEl.textContent = `topology: ${ev.message || 'error'}`;
   eventCountEl.textContent = String(state.eventCount);
   totalBytesEl.textContent = fmtBytes(state.totalBytes);
@@ -1022,7 +1131,10 @@ function render() {
     state.autoFit = false;
   }
   const now = Date.now();
-  const cutoffUs = (state.latestEventTimeUs || now * 1000) - recentWindowUs;
+  const eventNowUs = state.latestEventTimeUs > 0
+    ? state.latestEventTimeUs + Math.max(0, now - (state.latestEventWallTimeMs || now)) * 1000
+    : now * 1000;
+  const cutoffUs = eventNowUs - recentWindowUs;
   state.recent = state.recent.filter(x => x.t >= cutoffUs);
   windowRateEl.textContent = fmtBytes(rateFromSamples(state.recent)) + '/s';
   viewport.setAttribute('transform', `translate(${state.view.x} ${state.view.y}) scale(${state.view.k})`);
@@ -1243,16 +1355,136 @@ void JsonlEventSink::publish_topology_error(std::string const& message) const {
 void JsonlEventSink::publish_transfer(
     rapidsmpf::ucxx::UCXX::TelemetryEvent const& event
 ) const {
-    std::ostringstream ss;
-    ss << "{\"type\":\"transfer\",\"local_rank\":" << event.local_rank
-       << ",\"peer_rank\":" << event.peer_rank << ",\"tag\":" << event.tag
-       << ",\"direction\":" << json_string(direction_string(event.direction))
-       << ",\"bytes\":" << event.bytes << ",\"start_time_us\":" << event.start_time_us
-       << ",\"end_time_us\":" << event.end_time_us
-       << ",\"duration_seconds\":" << event.duration_seconds
-       << ",\"memory_type\":" << json_string(event.memory_type)
-       << ",\"debug_string\":" << json_string(event.debug_string) << "}";
-    publish_raw(ss.str());
+    publish_raw(transfer_json(event));
+}
+
+class TelemetryBatcher::Impl {
+  public:
+    Impl(std::shared_ptr<JsonlEventSink> sink, std::chrono::milliseconds interval)
+        : sink_{std::move(sink)}, interval_{interval}, last_flush_{Clock::now()} {}
+
+    ~Impl() {
+        flush();
+    }
+
+    void ingest(TelemetryEvent const& event) {
+        if (event.direction != TelemetryEvent::Direction::Send) {
+            return;
+        }
+
+        std::vector<Bucket> batch;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            add_locked(event);
+            auto const now = Clock::now();
+            if (now - last_flush_ < interval_) {
+                return;
+            }
+            batch = drain_locked(now);
+        }
+        publish(batch);
+    }
+
+    void flush() {
+        std::vector<Bucket> batch;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            batch = drain_locked(Clock::now());
+        }
+        publish(batch);
+    }
+
+  private:
+    using Clock = std::chrono::steady_clock;
+
+    struct Bucket {
+        TelemetryEvent event{};
+        std::uint64_t count{0};
+    };
+
+    static std::string key_for(
+        TelemetryEvent const& event, std::string const& debug_key
+    ) {
+        std::ostringstream ss;
+        ss << event.local_rank << '\x1f' << event.peer_rank << '\x1f' << event.tag
+           << '\x1f' << static_cast<int>(event.direction) << '\x1f' << event.memory_type
+           << '\x1f' << debug_key;
+        return ss.str();
+    }
+
+    void add_locked(TelemetryEvent const& event) {
+        auto debug_key = normalized_debug_key(event.debug_string);
+        auto& bucket = buckets_[key_for(event, debug_key)];
+        if (bucket.count == 0) {
+            bucket.event = event;
+            bucket.event.debug_string = std::move(debug_key);
+        } else {
+            auto& aggregate = bucket.event;
+            aggregate.bytes += event.bytes;
+            if (event.start_time_us > 0
+                && (aggregate.start_time_us == 0
+                    || event.start_time_us < aggregate.start_time_us))
+            {
+                aggregate.start_time_us = event.start_time_us;
+            }
+            aggregate.end_time_us = std::max(aggregate.end_time_us, event.end_time_us);
+            aggregate.duration_seconds += event.duration_seconds;
+        }
+        ++bucket.count;
+    }
+
+    std::vector<Bucket> drain_locked(Clock::time_point now) {
+        std::vector<Bucket> batch;
+        batch.reserve(buckets_.size());
+        for (auto& item : buckets_) {
+            batch.push_back(std::move(item.second));
+        }
+        buckets_.clear();
+        last_flush_ = now;
+        return batch;
+    }
+
+    void publish(std::vector<Bucket> const& batch) const {
+        if (!sink_ || batch.empty()) {
+            return;
+        }
+
+        std::ostringstream ss;
+        ss << "{\"type\":\"transfer_batch\",\"events\":[";
+        bool first = true;
+        for (auto const& bucket : batch) {
+            if (!first) {
+                ss << ',';
+            }
+            first = false;
+            ss << '{';
+            append_transfer_fields(ss, bucket.event, bucket.count);
+            ss << '}';
+        }
+        ss << "]}";
+        sink_->publish_raw(ss.str());
+    }
+
+    std::shared_ptr<JsonlEventSink> sink_;
+    std::chrono::milliseconds interval_;
+    Clock::time_point last_flush_;
+    std::mutex mutex_;
+    std::unordered_map<std::string, Bucket> buckets_;
+};
+
+TelemetryBatcher::TelemetryBatcher(
+    std::shared_ptr<JsonlEventSink> sink, std::chrono::milliseconds interval
+)
+    : impl_{std::make_unique<Impl>(std::move(sink), interval)} {}
+
+TelemetryBatcher::~TelemetryBatcher() = default;
+
+void TelemetryBatcher::ingest(rapidsmpf::ucxx::UCXX::TelemetryEvent const& event) {
+    impl_->ingest(event);
+}
+
+void TelemetryBatcher::flush() {
+    impl_->flush();
 }
 
 class Server::Impl {

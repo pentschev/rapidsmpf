@@ -370,6 +370,7 @@ int main(int argc, char** argv) {
 
     auto& log = comm->logger();
     std::shared_ptr<dashboard::JsonlEventSink> dashboard_sink;
+    std::shared_ptr<dashboard::TelemetryBatcher> dashboard_batcher;
     std::unique_ptr<dashboard::Server> dashboard_server;
     auto ucxx_comm = std::dynamic_pointer_cast<rapidsmpf::ucxx::UCXX>(comm);
     if (args.enable_dashboard) {
@@ -392,11 +393,12 @@ int main(int argc, char** argv) {
                 log->print("Dashboard: ", dashboard_server->url());
             }
 
+            dashboard_batcher =
+                std::make_shared<dashboard::TelemetryBatcher>(dashboard_sink);
             ucxx_comm->set_telemetry_callback(
-                [sink =
-                     dashboard_sink](rapidsmpf::ucxx::UCXX::TelemetryEvent const& event) {
-                    sink->publish_transfer(event);
-                }
+                [batcher = dashboard_batcher](
+                    rapidsmpf::ucxx::UCXX::TelemetryEvent const& event
+                ) { batcher->ingest(event); }
             );
 
             dashboard_sink->publish_rank(
@@ -513,6 +515,11 @@ int main(int argc, char** argv) {
         log->print(ss.str());
     }
     log->print(stats->report({.header = "Statistics (of the last run):"}));
+    if (dashboard_batcher) {
+        dashboard_batcher->flush();
+        ucxx_comm->set_telemetry_callback({});
+        ucxx_comm->barrier();
+    }
 
 #ifdef RAPIDSMPF_HAVE_CUPTI
     // Save CUPTI monitoring results to CSV file

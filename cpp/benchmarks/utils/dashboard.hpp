@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -34,6 +35,27 @@ class JsonlEventSink {
 
   private:
     std::filesystem::path path_;
+};
+
+class TelemetryBatcher {
+  public:
+    TelemetryBatcher(
+        std::shared_ptr<JsonlEventSink> sink,
+        std::chrono::milliseconds interval = std::chrono::milliseconds{100}
+    );
+    ~TelemetryBatcher();
+
+    TelemetryBatcher(TelemetryBatcher const&) = delete;
+    TelemetryBatcher& operator=(TelemetryBatcher const&) = delete;
+    TelemetryBatcher(TelemetryBatcher&&) = delete;
+    TelemetryBatcher& operator=(TelemetryBatcher&&) = delete;
+
+    void ingest(rapidsmpf::ucxx::UCXX::TelemetryEvent const& event);
+    void flush();
+
+  private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 class Server {

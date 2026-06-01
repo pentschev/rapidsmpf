@@ -252,6 +252,7 @@ body { overflow: hidden; }
 .node.gpu rect { fill: #3b927d; }
 .node.nic rect { fill: #4e72c6; }
 .node.switch rect { fill: #8a55a6; }
+.node.nvswitch rect { fill: #3a91aa; }
 .node.fabric rect { fill: #3a91aa; }
 .node.rank rect { fill: #b7642e; }
 .node.unknown rect { fill: #586069; }
@@ -323,6 +324,7 @@ const nodeBox = {
   gpu: [88, 42],
   nic: [112, 38],
   switch: [120, 34],
+  nvswitch: [132, 42],
   fabric: [138, 38],
   rank: [44, 28],
   unknown: [86, 32],
@@ -443,6 +445,52 @@ function ensureEdge(id, source, target, type, attrs = {}) {
   edge.attrs = {...edge.attrs, ...attrs};
   return edge;
 }
+function nvlinkPairs(topo, gpuIds) {
+  const pairs = new Map();
+  for (const gpu of topo.gpus || []) {
+    if (!gpuIds.has(gpu.id)) continue;
+    for (const peer of gpu.nvlink_peers || []) {
+      if (!gpuIds.has(peer.peer_gpu_id) || gpu.id === peer.peer_gpu_id) continue;
+      const lo = Math.min(gpu.id, peer.peer_gpu_id);
+      const hi = Math.max(gpu.id, peer.peer_gpu_id);
+      const id = `${lo}:${hi}`;
+      const existing = pairs.get(id) || {a: lo, b: hi, bandwidth: 0, links: 0};
+      existing.bandwidth = Math.max(existing.bandwidth, peer.bandwidth_gbps || 0);
+      existing.links = Math.max(existing.links, peer.link_count || 0);
+      pairs.set(id, existing);
+    }
+  }
+  return Array.from(pairs.values());
+}
+function inferNvSwitchFabric(topo, gpuIds) {
+  const gpuCount = gpuIds.size;
+  if (gpuCount < 4) return null;
+  const pairs = nvlinkPairs(topo, gpuIds);
+  if (pairs.length !== gpuCount - 1) return null;
+
+  const degree = new Map();
+  for (const id of gpuIds.keys()) degree.set(id, 0);
+  for (const pair of pairs) {
+    degree.set(pair.a, (degree.get(pair.a) || 0) + 1);
+    degree.set(pair.b, (degree.get(pair.b) || 0) + 1);
+  }
+  const center = Array.from(degree.entries()).find(([, value]) => value === gpuCount - 1)?.[0];
+  if (center === undefined) return null;
+
+  const perGpu = new Map();
+  let fallbackBandwidth = 0;
+  let fallbackLinks = 0;
+  for (const pair of pairs) {
+    if (pair.a !== center && pair.b !== center) return null;
+    const gpu = pair.a === center ? pair.b : pair.a;
+    const attrs = {bandwidth: pair.bandwidth, links: pair.links, inferredNvSwitch: true};
+    perGpu.set(gpu, attrs);
+    fallbackBandwidth = Math.max(fallbackBandwidth, pair.bandwidth || 0);
+    fallbackLinks = Math.max(fallbackLinks, pair.links || 0);
+  }
+  perGpu.set(center, {bandwidth: fallbackBandwidth, links: fallbackLinks, inferredNvSwitch: true});
+  return {center, perGpu};
+}
 function keepDirectNvlinkEdgesVisible(gpuIds) {
   const gpuSet = new Set(gpuIds.values());
   const nvlinks = Array.from(state.edges.values()).filter(edge =>
@@ -455,6 +503,7 @@ function processTopology(topo) {
   ensureNode(`host:${host}`, 'host', host, {host});
   const gpuIds = new Map();
   for (const gpu of topo.gpus || []) gpuIds.set(gpu.id, gpuNodeId(host, gpu));
+  const nvSwitch = inferNvSwitchFabric(topo, gpuIds);
   for (const cpu of topo.cpus || []) {
     const id = `cpu:${host}:${cpu.numa_node}`;
     ensureNode(id, 'cpu', `CPU ${cpu.numa_node}`, {
@@ -484,16 +533,27 @@ function processTopology(topo) {
     });
     ensureEdge(`contains:${host}:${id}`, `host:${host}`, id, 'contains');
     if (Number.isInteger(gpu.numa_node)) ensureEdge(`affinity:${host}:gpu${gpu.id}:numa${gpu.numa_node}`, id, `cpu:${host}:${gpu.numa_node}`, 'affinity');
-    for (const peer of gpu.nvlink_peers || []) {
-      if (!gpuIds.has(peer.peer_gpu_id)) continue;
-      const a = gpu.id < peer.peer_gpu_id ? gpuIds.get(gpu.id) : gpuIds.get(peer.peer_gpu_id);
-      const b = gpu.id < peer.peer_gpu_id ? gpuIds.get(peer.peer_gpu_id) : gpuIds.get(gpu.id);
-      ensureEdge(`nvlink:${host}:${a}:${b}`, a, b, 'nvlink', {
-        bandwidth: peer.bandwidth_gbps,
-        links: peer.link_count
-      });
+    if (!nvSwitch) {
+      for (const peer of gpu.nvlink_peers || []) {
+        if (!gpuIds.has(peer.peer_gpu_id)) continue;
+        const a = gpu.id < peer.peer_gpu_id ? gpuIds.get(gpu.id) : gpuIds.get(peer.peer_gpu_id);
+        const b = gpu.id < peer.peer_gpu_id ? gpuIds.get(peer.peer_gpu_id) : gpuIds.get(gpu.id);
+        ensureEdge(`nvlink:${host}:${a}:${b}`, a, b, 'nvlink', {
+          bandwidth: peer.bandwidth_gbps,
+          links: peer.link_count
+        });
+      }
     }
     for (const nic of gpu.network_devices || []) ensureEdge(`affinity:${host}:gpu${gpu.id}:${nic}`, id, `nic:${host}:${nic}`, 'affinity');
+  }
+  if (nvSwitch) {
+    const sid = `nvswitch:${host}:0`;
+    ensureNode(sid, 'nvswitch', 'NVSwitch', {host, inferred: true, centerGpu: nvSwitch.center});
+    ensureEdge(`contains:${host}:${sid}`, `host:${host}`, sid, 'contains');
+    for (const [gpuId, nodeId] of gpuIds.entries()) {
+      const attrs = nvSwitch.perGpu.get(gpuId) || {};
+      ensureEdge(`nvlink:${host}:${sid}:${nodeId}`, sid, nodeId, 'nvlink', attrs);
+    }
   }
   for (const nic of topo.network_devices || []) {
     const id = `nic:${host}:${nic.name}`;
@@ -927,9 +987,23 @@ function placeHost(spec) {
   for (const cpu of cpus) setTarget(cpu, targetForNuma(cpu, lanes, centerX), top + 70);
 
   const fabric = spec.nodes.find(node => node.type === 'fabric');
+  const nvSwitch = spec.nodes.find(node => node.type === 'nvswitch');
   const gpus = spec.nodes.filter(node => node.type === 'gpu').sort(compareNode);
   const gpuY = top + height * 0.47;
-  if (fabric && gpus.length >= 6) {
+  if (nvSwitch && gpus.length >= 2) {
+    setTarget(nvSwitch, centerX, gpuY);
+    const rows = gpus.length > 4 ? 2 : 1;
+    const cols = Math.ceil(gpus.length / rows);
+    const stepX = cols <= 1 ? 0 : Math.min(150, Math.max(105, (innerRight - innerLeft) / Math.max(1, cols - 1)));
+    const total = stepX * (cols - 1);
+    const x0 = centerX - total / 2;
+    for (let i = 0; i < gpus.length; i++) {
+      const row = Math.floor(i / cols);
+      const col = i % cols;
+      const y = rows === 1 ? gpuY + 96 : gpuY + (row === 0 ? -96 : 96);
+      setTarget(gpus[i], x0 + col * stepX, y);
+    }
+  } else if (fabric && gpus.length >= 6) {
     setTarget(fabric, centerX, gpuY);
     const rows = gpus.length > 4 ? 2 : 1;
     const cols = Math.ceil(gpus.length / rows);
@@ -1119,6 +1193,7 @@ function nodeSubtitle(node) {
   if (node.type === 'gpu') return node.attrs?.pci ? shortPci(node.attrs.pci) : '';
   if (node.type === 'nic') return node.attrs?.bandwidth ? `${node.attrs.bandwidth} GB/s` : 'disconnected';
   if (node.type === 'switch') return 'PCIe switch';
+  if (node.type === 'nvswitch') return 'NVLink fabric';
   if (node.type === 'fabric') return 'aggregated links';
   if (node.type === 'rank') return 'rank';
   return '';

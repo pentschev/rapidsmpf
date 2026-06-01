@@ -183,7 +183,7 @@ body { overflow: hidden; }
     <div class="title">RapidsMPF topology dashboard</div>
     <div class="stat">events <strong id="eventCount">0</strong></div>
     <div class="stat">transfer <strong id="totalBytes">0 B</strong></div>
-    <div class="stat">window <strong id="windowRate">0 B/s</strong></div>
+    <div class="stat">request avg <strong id="windowRate">0 B/s</strong></div>
     <div class="stat" id="status">connecting</div>
     <div class="spacer"></div>
     <div class="legend">
@@ -224,6 +224,7 @@ const state = {
   recent: [],
   eventCount: 0,
   totalBytes: 0,
+  latestEventTimeUs: 0,
   view: {x: 0, y: 0, k: 1},
   dragging: null,
   panning: null,
@@ -249,6 +250,7 @@ const linkLength = {
   transfer: 245,
   rank_gpu: 68
 };
+const recentWindowUs = 5_000_000;
 function svgEl(tag) {
   return document.createElementNS(SVG_NS, tag);
 }
@@ -485,6 +487,33 @@ function pcieRouteForGpus(gpuA, gpuB) {
     ...endpointEdges(gpuB, 'pcie')
   ]);
 }
+function eventEndUs(ev) {
+  const end = Number(ev.end_time_us);
+  if (Number.isFinite(end) && end > 0) return end;
+  return Date.now() * 1000;
+}
+function eventDurationSeconds(ev) {
+  const duration = Number(ev.duration_seconds);
+  if (Number.isFinite(duration) && duration > 0) return duration;
+  const start = Number(ev.start_time_us);
+  const end = Number(ev.end_time_us);
+  if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+    return (end - start) / 1_000_000;
+  }
+  return 0;
+}
+function transferSample(ev) {
+  return {
+    t: eventEndUs(ev),
+    bytes: ev.bytes || 0,
+    duration: eventDurationSeconds(ev)
+  };
+}
+function rateFromSamples(samples) {
+  const bytes = samples.reduce((sum, item) => sum + item.bytes, 0);
+  const seconds = samples.reduce((sum, item) => sum + item.duration, 0);
+  return seconds > 0 ? bytes / seconds : 0;
+}
 function shortestEdgePath(source, target, type) {
   if (source === target) return [];
   const seen = new Set([source]);
@@ -582,7 +611,7 @@ function routeTransfer(ev, transport) {
 function addTransferToPhysicalEdge(edge, ev, transport) {
   edge.bytes += ev.bytes || 0;
   edge.count += 1;
-  edge.recent.push({t: Date.now(), bytes: ev.bytes || 0});
+  edge.recent.push(transferSample(ev));
   edge.attrs.transport = transport;
 }
 function processTransfer(ev) {
@@ -607,7 +636,9 @@ function processTransfer(ev) {
   }
   for (const edge of mappedEdges) addTransferToPhysicalEdge(edge, ev, transport);
   state.totalBytes += ev.bytes || 0;
-  state.recent.push({t: Date.now(), bytes: ev.bytes || 0});
+  const sample = transferSample(ev);
+  state.recent.push(sample);
+  state.latestEventTimeUs = Math.max(state.latestEventTimeUs || 0, sample.t);
 }
 function processEvent(ev) {
   state.eventCount++;
@@ -991,9 +1022,9 @@ function render() {
     state.autoFit = false;
   }
   const now = Date.now();
-  state.recent = state.recent.filter(x => now - x.t < 5000);
-  const windowBytes = state.recent.reduce((a, x) => a + x.bytes, 0);
-  windowRateEl.textContent = fmtBytes(windowBytes / 5) + '/s';
+  const cutoffUs = (state.latestEventTimeUs || now * 1000) - recentWindowUs;
+  state.recent = state.recent.filter(x => x.t >= cutoffUs);
+  windowRateEl.textContent = fmtBytes(rateFromSamples(state.recent)) + '/s';
   viewport.setAttribute('transform', `translate(${state.view.x} ${state.view.y}) scale(${state.view.k})`);
   framesLayer.replaceChildren();
   edgesLayer.replaceChildren();
@@ -1055,8 +1086,8 @@ function render() {
     }
     edgesLayer.appendChild(path);
     if (e.bytes > 0) {
-      e.recent = e.recent.filter(x => now - x.t < 5000);
-      e.rate = e.recent.reduce((sum, item) => sum + item.bytes, 0) / 5;
+      e.recent = e.recent.filter(x => x.t >= cutoffUs);
+      e.rate = rateFromSamples(e.recent);
       const label = svgEl('text');
       label.setAttribute('class', 'edge-label');
       label.setAttribute('x', (a.x + b.x) / 2 + 4);

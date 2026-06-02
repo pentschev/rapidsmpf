@@ -90,8 +90,9 @@ std::unordered_map<shuffler::PartID, PackedData> partition_and_pack(
     RAPIDSMPF_NVTX_FUNC_RANGE();
     RAPIDSMPF_MEMORY_PROFILE(br->statistics(), br->device_mr());
     RAPIDSMPF_EXPECTS(num_partitions > 0, "Need to split to at least one partition");
+    auto const input_bytes = estimated_memory_usage(table, stream);
     br->statistics()->add_bytes_stat(
-        "cudf-partition-input-bytes", table.device_memory_size()
+        "cudf-partition-input-bytes", input_bytes
     );
     if (table.num_rows() == 0) {
         auto splits =
@@ -102,7 +103,7 @@ std::unordered_map<shuffler::PartID, PackedData> partition_and_pack(
     // hash_partition does a deep-copy. Therefore, we need to reserve memory for
     // at least the size of the table.
     auto reservation = br->reserve_device_memory_and_spill(
-        estimated_memory_usage(table, stream), allow_overbooking
+        input_bytes, allow_overbooking
     );
     auto [reordered, split_points] = cudf::hash_partition(
         table,
@@ -148,7 +149,11 @@ std::unordered_map<shuffler::PartID, PackedData> split_and_pack(
     }
     std::size_t total_packed_bytes = 0;
     for (auto const& [_, packed_data] : ret) {
-        total_packed_bytes += packed_data.data ? packed_data.data->size : 0;
+        std::size_t const packed_bytes = packed_data.data ? packed_data.data->size : 0;
+        total_packed_bytes += packed_bytes;
+        br->statistics()->add_bytes_stat(
+            "cudf-partition-packed-partition-bytes", packed_bytes
+        );
     }
     br->statistics()->add_bytes_stat(
         "cudf-partition-packed-bytes", total_packed_bytes

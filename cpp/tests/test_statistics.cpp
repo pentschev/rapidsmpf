@@ -4,11 +4,13 @@
  */
 
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <sstream>
 #include <vector>
 
@@ -19,6 +21,7 @@
 
 #include <rapidsmpf/communicator/mpi.hpp>
 #include <rapidsmpf/integrations/cudf/partition.hpp>
+#include <rapidsmpf/integrations/cudf/utils.hpp>
 #include <rapidsmpf/memory/buffer_resource.hpp>
 #include <rapidsmpf/rmm_resource_adaptor.hpp>
 #include <rapidsmpf/statistics.hpp>
@@ -75,6 +78,7 @@ TEST_F(StatisticsTest, Communication) {
 }
 
 TEST_F(StatisticsTest, CudfPartitionPackingBytes) {
+    constexpr int num_partitions = 2;
     auto stats = rapidsmpf::Statistics::create();
     auto br = rapidsmpf::BufferResource::create(
         cudf::get_current_device_resource_ref(),
@@ -88,10 +92,20 @@ TEST_F(StatisticsTest, CudfPartitionPackingBytes) {
     );
     auto stream = cudf::get_default_stream();
     cudf::table input = random_table_with_index(42, 8, 0, 10);
+    auto const expected_input_bytes = estimated_memory_usage(input.view(), stream);
 
     auto packed = rapidsmpf::partition_and_pack(
-        input, {1}, 2, cudf::hash_id::HASH_MURMUR3, 42, stream, br.get()
+        input, {1}, num_partitions, cudf::hash_id::HASH_MURMUR3, 42, stream, br.get()
     );
+
+    std::size_t total_packed_bytes = 0;
+    std::size_t max_packed_bytes = 0;
+    for (auto const& packed_data : std::views::values(packed)) {
+        std::size_t const packed_bytes =
+            packed_data.data ? packed_data.data->size : 0;
+        total_packed_bytes += packed_bytes;
+        max_packed_bytes = std::max(max_packed_bytes, packed_bytes);
+    }
 
     std::vector<rapidsmpf::PackedData> packed_vector;
     packed_vector.reserve(packed.size());
@@ -102,11 +116,29 @@ TEST_F(StatisticsTest, CudfPartitionPackingBytes) {
     auto result =
         rapidsmpf::unpack_and_concat(std::move(packed_vector), stream, br.get());
     ASSERT_NE(result, nullptr);
+    auto const expected_output_bytes = result->alloc_size();
 
-    EXPECT_GT(stats->get_stat("cudf-partition-input-bytes").count(), 0);
-    EXPECT_GT(stats->get_stat("cudf-partition-packed-bytes").count(), 0);
-    EXPECT_GT(stats->get_stat("cudf-unpack-input-bytes").count(), 0);
-    EXPECT_GT(stats->get_stat("cudf-unpack-output-bytes").count(), 0);
+    auto const partition_input = stats->get_stat("cudf-partition-input-bytes");
+    EXPECT_EQ(partition_input.count(), 1);
+    EXPECT_EQ(partition_input.value(), expected_input_bytes);
+
+    auto const partition_packed = stats->get_stat("cudf-partition-packed-bytes");
+    EXPECT_EQ(partition_packed.count(), 1);
+    EXPECT_EQ(partition_packed.value(), total_packed_bytes);
+
+    auto const partition_packed_by_partition =
+        stats->get_stat("cudf-partition-packed-partition-bytes");
+    EXPECT_EQ(partition_packed_by_partition.count(), num_partitions);
+    EXPECT_EQ(partition_packed_by_partition.value(), total_packed_bytes);
+    EXPECT_EQ(partition_packed_by_partition.max(), max_packed_bytes);
+
+    auto const unpack_input = stats->get_stat("cudf-unpack-input-bytes");
+    EXPECT_EQ(unpack_input.count(), 1);
+    EXPECT_EQ(unpack_input.value(), total_packed_bytes);
+
+    auto const unpack_output = stats->get_stat("cudf-unpack-output-bytes");
+    EXPECT_EQ(unpack_output.count(), 1);
+    EXPECT_EQ(unpack_output.value(), expected_output_bytes);
 }
 
 TEST_F(StatisticsTest, AddReportEntryArityMismatchThrowsOnRender) {

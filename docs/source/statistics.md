@@ -7,10 +7,11 @@ This table gives an overview of the different statistics collected.
 | --- | --- |
 | `alloc-{memtype}` | Bytes allocated via `BufferResource::allocate()`, broken down by memory type (`device`, `pinned_host`, `host`). Shows total bytes, total time, allocation throughput, and average stream delay. |
 | `copy-{src}-to-{dst}` | Amount of data copied between memory types by RapidsMPF. `{src}` and `{dst}` are `device`, `pinned_host`, or `host`. Shows total bytes, total copy time, throughput, and average stream delay (time between CPU submission and GPU execution of the copy). |
-| `cudf-partition-input-bytes` | Input table bytes presented to cuDF partitioning. |
-| `cudf-partition-packed-bytes` | Packed payload bytes emitted by cuDF partitioning. |
-| `cudf-unpack-input-bytes` | Packed payload bytes consumed by cuDF unpack. |
-| `cudf-unpack-output-bytes` | Output table bytes produced by cuDF unpack. |
+| `cudf-partition-input-bytes` | Logical input table bytes presented to cuDF partitioning, measured from the input `cudf::table_view` buffers. |
+| `cudf-partition-packed-bytes` | Total packed payload bytes emitted by cuDF partitioning across all output partitions. |
+| `cudf-partition-packed-partition-bytes` | Packed payload bytes emitted for each individual cuDF output partition. |
+| `cudf-unpack-input-bytes` | Total packed payload bytes consumed by cuDF unpack. |
+| `cudf-unpack-output-bytes` | Output table allocation bytes produced by cuDF unpack, measured with `cudf::table::alloc_size()`. |
 | `event-loop-check-future-finish` | Time spent polling for completed data transfers. |
 | `event-loop-init-gpu-data-send` | Time spent initiating GPU data sends. Does not include actual transfer time. |
 | `event-loop-metadata-recv` | Time spent receiving chunk metadata from other ranks. |

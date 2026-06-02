@@ -73,10 +73,12 @@ void TagMetadataPayloadExchange::send(
             std::make_unique<std::vector<std::uint8_t>>(message->release_metadata());
 
         // Reserve space for message_id and payload_size at the end
-        std::size_t original_size = combined_metadata->size();
-        combined_metadata->resize(
-            original_size + sizeof(std::uint64_t) + sizeof(std::size_t)
-        );
+        std::size_t const original_size = combined_metadata->size();
+        std::size_t const protocol_overhead =
+            sizeof(std::uint64_t) + sizeof(std::size_t);
+        std::size_t const combined_metadata_size =
+            original_size + protocol_overhead;
+        combined_metadata->resize(combined_metadata_size);
 
         // Append message_id
         std::memcpy(
@@ -93,6 +95,9 @@ void TagMetadataPayloadExchange::send(
         fire_and_forget_.push_back(
             comm_->send(std::move(combined_metadata), dst, metadata_tag_)
         );
+        statistics_->add_stat("metadata-payload-message-send", 1.0);
+        statistics_->add_bytes_stat("metadata-payload-metadata-send", original_size);
+        statistics_->add_bytes_stat("metadata-payload-payload-send", payload_size);
 
         // Send data immediately after metadata (if any)
         if (payload_size > 0) {
@@ -239,6 +244,13 @@ void TagMetadataPayloadExchange::receive_metadata() {
 
             // Normal application message.
             peer_received_[p]++;
+            statistics_->add_stat("metadata-payload-message-recv", 1.0);
+            statistics_->add_bytes_stat(
+                "metadata-payload-metadata-recv", original_metadata_size
+            );
+            statistics_->add_bytes_stat(
+                "metadata-payload-payload-recv", payload_size
+            );
 
             std::vector<std::uint8_t> original_metadata(
                 msg->begin(),

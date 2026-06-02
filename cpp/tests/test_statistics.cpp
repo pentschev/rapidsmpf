@@ -5,6 +5,8 @@
 
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -12,6 +14,7 @@
 #include <optional>
 #include <ranges>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -24,6 +27,7 @@
 #include <rapidsmpf/integrations/cudf/utils.hpp>
 #include <rapidsmpf/memory/buffer_resource.hpp>
 #include <rapidsmpf/rmm_resource_adaptor.hpp>
+#include <rapidsmpf/shuffler/shuffler.hpp>
 #include <rapidsmpf/statistics.hpp>
 #include <rapidsmpf/utils/string.hpp>
 
@@ -139,6 +143,103 @@ TEST_F(StatisticsTest, CudfPartitionPackingBytes) {
     auto const unpack_output = stats->get_stat("cudf-unpack-output-bytes");
     EXPECT_EQ(unpack_output.count(), 1);
     EXPECT_EQ(unpack_output.value(), expected_output_bytes);
+}
+
+TEST(StatisticsTransportTest, ShuffleTransportCounters) {
+    auto const& comm = GlobalEnvironment->comm_;
+    if (comm->nranks() < 2) {
+        GTEST_SKIP() << "Test requires at least 2 ranks";
+    }
+
+    auto stats = rapidsmpf::Statistics::create();
+    auto br = rapidsmpf::BufferResource::create(
+        cudf::get_current_device_resource_ref(),
+        rapidsmpf::PinnedMemoryResource::Disabled,
+        {},
+        std::nullopt,
+        std::make_shared<rmm::cuda_stream_pool>(
+            1, rmm::cuda_stream::flags::non_blocking
+        ),
+        stats
+    );
+
+    auto stream = cudf::get_default_stream();
+    auto const metadata_size = std::size_t{2};
+    auto const payload_size = std::size_t{16};
+    auto const total_num_partitions =
+        rapidsmpf::safe_cast<rapidsmpf::shuffler::PartID>(comm->nranks());
+    auto const remote_partition =
+        rapidsmpf::safe_cast<rapidsmpf::shuffler::PartID>(
+            (comm->rank() + 1) % comm->nranks()
+        );
+
+    {
+        auto allocate_fn = [br, stream](std::size_t size) {
+            return br->make_buffer(
+                stream, br->reserve_or_fail(size, rapidsmpf::MemoryType::HOST)
+            );
+        };
+        auto mpe =
+            std::make_unique<rapidsmpf::communicator::TagMetadataPayloadExchange>(
+                comm, 1234, allocate_fn, stats
+            );
+        rapidsmpf::shuffler::Shuffler shuffler(
+            comm,
+            1234,
+            total_num_partitions,
+            br.get(),
+            rapidsmpf::shuffler::Shuffler::round_robin,
+            std::move(mpe)
+        );
+
+        std::unordered_map<rapidsmpf::shuffler::PartID, rapidsmpf::PackedData>
+            chunks;
+        auto metadata = std::make_unique<std::vector<std::uint8_t>>(
+            std::initializer_list<std::uint8_t>{
+                static_cast<std::uint8_t>(comm->rank()), 0xAB}
+        );
+        ASSERT_EQ(metadata->size(), metadata_size);
+        auto payload = iota_vector<std::uint8_t>(payload_size, 1);
+        auto data = br->make_buffer(
+            stream,
+            br->reserve_or_fail(payload.size(), rapidsmpf::MemoryType::HOST)
+        );
+        data->write_access([&payload](std::byte* ptr, rmm::cuda_stream_view) {
+            std::memcpy(ptr, payload.data(), payload.size());
+        });
+        stream.synchronize();
+
+        chunks.emplace(
+            remote_partition,
+            rapidsmpf::PackedData{std::move(metadata), std::move(data)}
+        );
+        shuffler.insert(std::move(chunks));
+        shuffler.insert_finished();
+
+        EXPECT_NO_THROW(shuffler.wait(std::chrono::seconds{30}));
+    }
+
+    EXPECT_GT(stats->get_stat("metadata-payload-message-send").count(), 0);
+    EXPECT_GT(stats->get_stat("metadata-payload-message-recv").count(), 0);
+    EXPECT_GT(stats->get_stat("shuffle-chunks-submit").count(), 0);
+    EXPECT_GT(stats->get_stat("shuffle-nonempty-chunks-submit").count(), 0);
+    EXPECT_GT(stats->get_stat("shuffle-chunks-recv").count(), 0);
+
+    auto const metadata_send =
+        stats->get_stat("metadata-payload-metadata-send");
+    auto const metadata_recv =
+        stats->get_stat("metadata-payload-metadata-recv");
+    EXPECT_GT(metadata_send.count(), 0);
+    EXPECT_EQ(metadata_send.count(), metadata_recv.count());
+    EXPECT_GT(metadata_send.value(), 0);
+    EXPECT_EQ(metadata_send.value(), metadata_recv.value());
+
+    auto const payload_send = stats->get_stat("metadata-payload-payload-send");
+    auto const payload_recv = stats->get_stat("metadata-payload-payload-recv");
+    EXPECT_GT(payload_send.count(), 0);
+    EXPECT_EQ(payload_send.count(), payload_recv.count());
+    EXPECT_EQ(payload_send.value(), payload_size);
+    EXPECT_EQ(payload_recv.value(), payload_size);
 }
 
 TEST_F(StatisticsTest, AddReportEntryArityMismatchThrowsOnRender) {

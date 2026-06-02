@@ -98,6 +98,10 @@ class Shuffler::Progress {
             RAPIDSMPF_NVTX_SCOPED_RANGE_VERBOSE("submit_outgoing", ready_chunks.size());
 
             if (!ready_chunks.empty()) {
+                stats.add_stat(
+                    "shuffle-chunks-submit", static_cast<double>(ready_chunks.size())
+                );
+
                 auto peer_rank_fn = [&shuffler =
                                          shuffler_](detail::Chunk const& chunk) -> Rank {
                     auto dst = shuffler.partition_owner(
@@ -114,6 +118,7 @@ class Shuffler::Progress {
 
                 for (auto const& chunk : ready_chunks) {
                     if (chunk.data_size() > 0) {
+                        stats.add_stat("shuffle-nonempty-chunks-submit", 1.0);
                         stats.add_bytes_stat("shuffle-payload-send", chunk.data_size());
                     }
                 }
@@ -140,6 +145,7 @@ class Shuffler::Progress {
                 auto chunk = detail::Chunk::deserialize(
                     message->metadata(), shuffler_.br_, false, message->release_data()
                 );
+                stats.add_stat("shuffle-chunks-recv", 1.0);
 
                 RAPIDSMPF_EXPECTS(
                     shuffler_.partition_owner(

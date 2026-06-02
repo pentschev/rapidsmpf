@@ -18,7 +18,16 @@ This table gives an overview of the different statistics collected.
 | `event-loop-metadata-send` | Time spent sending chunk metadata to other ranks. |
 | `event-loop-post-incoming-chunk-recv` | Time spent posting receive buffers for incoming chunk data. |
 | `event-loop-total` | Time spent in one Shuffler event-loop iteration. |
+| `metadata-payload-message-recv` | Application messages decoded by metadata-payload exchange. |
+| `metadata-payload-message-send` | Application messages submitted through metadata-payload exchange. |
+| `metadata-payload-metadata-recv` | Application metadata bytes decoded by metadata-payload exchange, excluding protocol trailer bytes. |
+| `metadata-payload-metadata-send` | Application metadata bytes submitted through metadata-payload exchange, excluding protocol trailer bytes. |
+| `metadata-payload-payload-recv` | Payload bytes received through metadata-payload exchange. |
+| `metadata-payload-payload-send` | Payload bytes sent through metadata-payload exchange. |
 | `recv-into-host-memory` | Data received directly into host memory rather than device memory, due to memory pressure at receive time. |
+| `shuffle-chunks-recv` | Number of chunks completed by the shuffler progress loop. |
+| `shuffle-chunks-submit` | Number of chunks submitted by the shuffler progress loop. |
+| `shuffle-nonempty-chunks-submit` | Number of non-empty chunks submitted for transport. |
 | `shuffle-payload-recv` | Shuffle data received by this rank, including self-transfers. |
 | `shuffle-payload-send` | Shuffle data sent from this rank, including self-transfers. |
 

@@ -3,13 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <algorithm>
+#include <limits>
 #include <utility>
 
 #include <cudf/concatenate.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/dictionary/encode.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
+#include <cudf/utilities/traits.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
@@ -24,6 +29,127 @@
 #include <rapidsmpf/utils/misc.hpp>
 
 namespace rapidsmpf {
+
+namespace {
+
+struct MaterializedTableView {
+    std::vector<std::unique_ptr<cudf::column>> owned_columns;
+    cudf::table_view view;
+
+    MaterializedTableView(
+        std::vector<std::unique_ptr<cudf::column>> owned_columns,
+        cudf::table_view view
+    )
+        : owned_columns{std::move(owned_columns)}, view{std::move(view)} {}
+};
+
+std::size_t checked_add(std::size_t lhs, std::size_t rhs) {
+    RAPIDSMPF_EXPECTS(
+        lhs <= std::numeric_limits<std::size_t>::max() - rhs,
+        "Decoded dictionary column memory estimate overflowed",
+        std::overflow_error
+    );
+    return lhs + rhs;
+}
+
+std::size_t checked_multiply(std::size_t lhs, std::size_t rhs) {
+    RAPIDSMPF_EXPECTS(
+        lhs == 0 || rhs <= std::numeric_limits<std::size_t>::max() / lhs,
+        "Decoded dictionary column memory estimate overflowed",
+        std::overflow_error
+    );
+    return lhs * rhs;
+}
+
+std::size_t estimate_decoded_dictionary_column_memory(
+    cudf::dictionary_column_view const& dictionary_column,
+    rmm::cuda_stream_view stream
+) {
+    auto const rows = safe_cast<std::size_t>(dictionary_column.size());
+    if (rows == 0) {
+        return 0;
+    }
+
+    std::size_t const null_mask_bytes =
+        dictionary_column.has_nulls()
+            ? cudf::bitmask_allocation_size_bytes(dictionary_column.size())
+            : 0;
+    auto const keys = dictionary_column.keys();
+    if (cudf::is_fixed_width(keys.type())) {
+        return checked_add(
+            checked_multiply(rows, cudf::size_of(keys.type())), null_mask_bytes
+        );
+    }
+    if (keys.type().id() == cudf::type_id::STRING) {
+        // Decoded rows may be arbitrarily skewed toward the longest key. Using the
+        // total dictionary chars per row is conservative without allocating another
+        // pre-reservation column to compute per-key byte lengths.
+        auto const total_key_chars =
+            safe_cast<std::size_t>(cudf::strings_column_view{keys}.chars_size(stream));
+        auto const offsets_bytes =
+            checked_multiply(checked_add(rows, 1), sizeof(cudf::size_type));
+        return checked_add(
+            checked_add(offsets_bytes, checked_multiply(rows, total_key_chars)),
+            null_mask_bytes
+        );
+    }
+    return checked_add(estimated_memory_usage(keys, stream), null_mask_bytes);
+}
+
+std::unique_ptr<MaterializedTableView> materialize_dictionary_columns(
+    cudf::table_view const& input,
+    rmm::cuda_stream_view stream,
+    BufferResource* br,
+    AllowOverbooking allow_overbooking
+) {
+    auto const has_dictionary_columns = std::ranges::any_of(
+        input,
+        [](cudf::column_view const& column) {
+            return column.type().id() == cudf::type_id::DICTIONARY32;
+        }
+    );
+    if (!has_dictionary_columns) {
+        return nullptr;
+    }
+
+    std::size_t decode_reservation_size = 0;
+    for (auto const& column : input) {
+        if (column.type().id() == cudf::type_id::DICTIONARY32) {
+            decode_reservation_size = checked_add(
+                decode_reservation_size,
+                estimate_decoded_dictionary_column_memory(
+                    cudf::dictionary_column_view{column}, stream
+                )
+            );
+        }
+    }
+
+    auto reservation = br->reserve_device_memory_and_spill(
+        decode_reservation_size, allow_overbooking
+    );
+
+    auto owned_columns = std::vector<std::unique_ptr<cudf::column>>{};
+    auto column_views = std::vector<cudf::column_view>{};
+    owned_columns.reserve(safe_cast<std::size_t>(input.num_columns()));
+    column_views.reserve(safe_cast<std::size_t>(input.num_columns()));
+    for (auto const& column : input) {
+        if (column.type().id() == cudf::type_id::DICTIONARY32) {
+            owned_columns.push_back(cudf::dictionary::decode(
+                cudf::dictionary_column_view{column}, stream, br->device_mr()
+            ));
+            column_views.push_back(owned_columns.back()->view());
+        } else {
+            column_views.push_back(column);
+        }
+    }
+    reservation.clear();
+
+    return std::make_unique<MaterializedTableView>(
+        std::move(owned_columns), cudf::table_view{column_views}
+    );
+}
+
+}  // namespace
 
 std::pair<std::vector<cudf::table_view>, std::unique_ptr<cudf::table>>
 partition_and_split(
@@ -85,19 +211,24 @@ std::unordered_map<shuffler::PartID, PackedData> partition_and_pack(
     std::uint32_t seed,
     rmm::cuda_stream_view stream,
     BufferResource* br,
-    AllowOverbooking allow_overbooking
+    AllowOverbooking allow_overbooking,
+    PartitionPackOptions options
 ) {
     RAPIDSMPF_NVTX_FUNC_RANGE();
     RAPIDSMPF_MEMORY_PROFILE(br->statistics(), br->device_mr());
     RAPIDSMPF_EXPECTS(num_partitions > 0, "Need to split to at least one partition");
-    auto const input_bytes = estimated_memory_usage(table, stream);
+    auto materialized_table = options.preserve_encoded ? nullptr :
+        materialize_dictionary_columns(table, stream, br, allow_overbooking);
+    cudf::table_view const partition_input =
+        materialized_table ? materialized_table->view : table;
+    auto const input_bytes = estimated_memory_usage(partition_input, stream);
     br->statistics()->add_bytes_stat(
         "cudf-partition-input-bytes", input_bytes
     );
-    if (table.num_rows() == 0) {
+    if (partition_input.num_rows() == 0) {
         auto splits =
             std::vector<cudf::size_type>(safe_cast<std::uint64_t>(num_partitions - 1), 0);
-        return split_and_pack(table, splits, stream, br, allow_overbooking);
+        return split_and_pack(partition_input, splits, stream, br, allow_overbooking);
     }
 
     // hash_partition does a deep-copy. Therefore, we need to reserve memory for
@@ -106,7 +237,7 @@ std::unordered_map<shuffler::PartID, PackedData> partition_and_pack(
         input_bytes, allow_overbooking
     );
     auto [reordered, split_points] = cudf::hash_partition(
-        table,
+        partition_input,
         columns_to_hash,
         num_partitions,
         hash_function,

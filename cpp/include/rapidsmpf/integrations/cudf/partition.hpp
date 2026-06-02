@@ -54,6 +54,15 @@ partition_and_split(
 
 
 /**
+ * @brief Options controlling partition packing behavior.
+ */
+struct PartitionPackOptions {
+    ///< If true, keep encoded columns in their existing representation.
+    ///< If false, materialize encoded columns before partitioning.
+    bool preserve_encoded{true};
+};
+
+/**
  * @brief Partitions rows from the input table into multiple packed (serialized) tables.
  *
  * @param table The table to partition.
@@ -64,6 +73,7 @@ partition_and_split(
  * @param stream CUDA stream used for device memory operations and kernel launches.
  * @param br Buffer resource for memory allocations.
  * @param allow_overbooking If true, allow overbooking (true by default)
+ * @param options Partition packing policy options.
  * // TODO: disable this by default https://github.com/rapidsmpf/rapidsmpf/issues/449
  *
  * @return A map of partition IDs and their packed tables.
@@ -82,7 +92,8 @@ partition_and_split(
     std::uint32_t seed,
     rmm::cuda_stream_view stream,
     BufferResource* br,
-    AllowOverbooking allow_overbooking = AllowOverbooking::YES
+    AllowOverbooking allow_overbooking = AllowOverbooking::YES,
+    PartitionPackOptions options = {}
 );
 
 

@@ -16,6 +16,8 @@ def partition_and_pack(
     num_partitions: int,
     stream: Stream,
     br: BufferResource,
+    *,
+    preserve_encoded: bool = True,
 ) -> dict[int, PackedData]: ...
 def split_and_pack(
     table: Table,

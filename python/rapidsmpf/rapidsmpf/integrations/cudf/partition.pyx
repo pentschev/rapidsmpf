@@ -29,6 +29,9 @@ cdef extern from "<rapidsmpf/integrations/cudf/partition.hpp>" nogil:
     int cpp_HASH_MURMUR3"cudf::hash_id::HASH_MURMUR3"
     uint32_t cpp_DEFAULT_HASH_SEED"cudf::DEFAULT_HASH_SEED",
 
+    cdef cppclass cpp_PartitionPackOptions "rapidsmpf::PartitionPackOptions":
+        bool_t preserve_encoded
+
     cdef unordered_map[uint32_t, cpp_PackedData] cpp_partition_and_pack \
         "rapidsmpf::partition_and_pack"(
             const table_view& table,
@@ -38,6 +41,8 @@ cdef extern from "<rapidsmpf/integrations/cudf/partition.hpp>" nogil:
             uint32_t seed,
             cuda_stream_view stream,
             cpp_BufferResource* br,
+            AllowOverbooking allow_overbooking,
+            cpp_PartitionPackOptions options,
         ) except +ex_handler
 
     cdef unordered_map[uint32_t, cpp_PackedData] cpp_split_and_pack \
@@ -55,6 +60,8 @@ def partition_and_pack(
     int num_partitions,
     Stream stream not None,
     BufferResource br not None,
+    *,
+    bool_t preserve_encoded=True,
 ):
     """
     Partition rows from the input table into multiple packed (serialized) tables.
@@ -71,6 +78,9 @@ def partition_and_pack(
         The CUDA stream used for memory operations.
     br
         Buffer resource for memory allocations.
+    preserve_encoded
+        If True, keep encoded columns in their existing representation. If
+        False, materialize encoded columns before partitioning.
 
     Returns
     -------
@@ -93,6 +103,8 @@ def partition_and_pack(
     cdef vector[size_type] _columns_to_hash = tuple(columns_to_hash)
     cdef unordered_map[uint32_t, cpp_PackedData] _ret
     cdef table_view tbl = table.view()
+    cdef cpp_PartitionPackOptions options
+    options.preserve_encoded = preserve_encoded
     with nogil:
         _ret = cpp_partition_and_pack(
             tbl,
@@ -102,6 +114,8 @@ def partition_and_pack(
             cpp_DEFAULT_HASH_SEED,
             _stream,
             _br,
+            AllowOverbooking.YES,
+            options,
         )
     ret = {}
     cdef unordered_map[uint32_t, cpp_PackedData].iterator it = _ret.begin()

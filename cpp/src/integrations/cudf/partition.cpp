@@ -90,6 +90,9 @@ std::unordered_map<shuffler::PartID, PackedData> partition_and_pack(
     RAPIDSMPF_NVTX_FUNC_RANGE();
     RAPIDSMPF_MEMORY_PROFILE(br->statistics(), br->device_mr());
     RAPIDSMPF_EXPECTS(num_partitions > 0, "Need to split to at least one partition");
+    br->statistics()->add_bytes_stat(
+        "cudf-partition-input-bytes", table.device_memory_size()
+    );
     if (table.num_rows() == 0) {
         auto splits =
             std::vector<cudf::size_type>(safe_cast<std::uint64_t>(num_partitions - 1), 0);
@@ -143,6 +146,13 @@ std::unordered_map<shuffler::PartID, PackedData> split_and_pack(
             )
         );
     }
+    std::size_t total_packed_bytes = 0;
+    for (auto const& [_, packed_data] : ret) {
+        total_packed_bytes += packed_data.data ? packed_data.data->size : 0;
+    }
+    br->statistics()->add_bytes_stat(
+        "cudf-partition-packed-bytes", total_packed_bytes
+    );
     return ret;
 }
 
@@ -157,17 +167,20 @@ std::unique_ptr<cudf::table> unpack_and_concat(
 
     // Let's find the total size of the partitions and how much of the packed data we
     // need to move to device memory (unspill).
-    std::size_t total_size = 0;
+    std::size_t total_packed_bytes = 0;
     std::size_t non_device_size = 0;
     for (auto& packed_data : partitions) {
         if (!packed_data.empty()) {
             std::size_t size = packed_data.data->size;
-            total_size += size;
+            total_packed_bytes += size;
             if (packed_data.data->mem_type() != MemoryType::DEVICE) {
                 non_device_size += size;
             }
         }
     }
+    br->statistics()->add_bytes_stat(
+        "cudf-unpack-input-bytes", total_packed_bytes
+    );
 
     std::vector<cudf::table_view> unpacked;
     std::vector<cudf::packed_columns> references;
@@ -178,7 +191,7 @@ std::unique_ptr<cudf::table> unpack_and_concat(
 
     // Reserve device memory for the unspill AND the cudf::unpack() calls.
     auto reservation = br->reserve_device_memory_and_spill(
-        total_size + non_device_size, allow_overbooking
+        total_packed_bytes + non_device_size, allow_overbooking
     );
     for (auto& packed_data : partitions) {
         if (!packed_data.empty()) {
@@ -204,8 +217,11 @@ std::unique_ptr<cudf::table> unpack_and_concat(
         packed_columns.gpu_data->set_stream(stream);
     }
 
-    reservation = br->reserve_device_memory_and_spill(total_size, allow_overbooking);
-    return cudf::concatenate(unpacked, stream, br->device_mr());
+    reservation =
+        br->reserve_device_memory_and_spill(total_packed_bytes, allow_overbooking);
+    auto result = cudf::concatenate(unpacked, stream, br->device_mr());
+    br->statistics()->add_bytes_stat("cudf-unpack-output-bytes", result->alloc_size());
+    return result;
 }
 
 std::vector<PackedData> spill_partitions(

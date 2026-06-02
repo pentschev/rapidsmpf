@@ -7,7 +7,10 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <sstream>
+#include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -15,6 +18,8 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rapidsmpf/communicator/mpi.hpp>
+#include <rapidsmpf/integrations/cudf/partition.hpp>
+#include <rapidsmpf/memory/buffer_resource.hpp>
 #include <rapidsmpf/rmm_resource_adaptor.hpp>
 #include <rapidsmpf/statistics.hpp>
 #include <rapidsmpf/utils/string.hpp>
@@ -67,6 +72,41 @@ TEST_F(StatisticsTest, Communication) {
     stats->add_bytes_stat("byte-statistics", 20);
     EXPECT_THAT(stats->report(), ::testing::HasSubstr("byte-statistics"));
     EXPECT_THAT(stats->report(), ::testing::HasSubstr("20 B"));
+}
+
+TEST_F(StatisticsTest, CudfPartitionPackingBytes) {
+    auto stats = rapidsmpf::Statistics::create();
+    auto br = rapidsmpf::BufferResource::create(
+        cudf::get_current_device_resource_ref(),
+        rapidsmpf::PinnedMemoryResource::Disabled,
+        {},
+        std::nullopt,
+        std::make_shared<rmm::cuda_stream_pool>(
+            1, rmm::cuda_stream::flags::non_blocking
+        ),
+        stats
+    );
+    auto stream = cudf::get_default_stream();
+    cudf::table input = random_table_with_index(42, 8, 0, 10);
+
+    auto packed = rapidsmpf::partition_and_pack(
+        input, {1}, 2, cudf::hash_id::HASH_MURMUR3, 42, stream, br.get()
+    );
+
+    std::vector<rapidsmpf::PackedData> packed_vector;
+    packed_vector.reserve(packed.size());
+    for (auto& [_, partition] : packed) {
+        packed_vector.push_back(std::move(partition));
+    }
+
+    auto result =
+        rapidsmpf::unpack_and_concat(std::move(packed_vector), stream, br.get());
+    ASSERT_NE(result, nullptr);
+
+    EXPECT_GT(stats->get_stat("cudf-partition-input-bytes").count(), 0);
+    EXPECT_GT(stats->get_stat("cudf-partition-packed-bytes").count(), 0);
+    EXPECT_GT(stats->get_stat("cudf-unpack-input-bytes").count(), 0);
+    EXPECT_GT(stats->get_stat("cudf-unpack-output-bytes").count(), 0);
 }
 
 TEST_F(StatisticsTest, AddReportEntryArityMismatchThrowsOnRender) {

@@ -75,6 +75,10 @@ cdef extern from *:
         }
         return result;
     }
+
+    std::size_t cpp_packed_data_data_size(rapidsmpf::PackedData* pd) {
+        return pd->data->size;
+    }
     """
     unique_ptr[cpp_PackedData] cpp_packed_data_from_buffers(
         unique_ptr[vector[uint8_t]] metadata,
@@ -92,6 +96,10 @@ cdef extern from *:
     vector[uint8_t] cpp_packed_data_to_host_bytes(
         cpp_PackedData* pd,
     ) except + nogil
+
+    size_t cpp_packed_data_data_size(
+        cpp_PackedData* pd,
+    ) noexcept nogil
 
 
 cdef class PackedData:
@@ -217,6 +225,23 @@ cdef class PackedData:
         with nogil:
             result = cpp_packed_data_to_host_bytes(self.c_obj.get())
         return bytes(result)
+
+    def data_size(self) -> int:
+        """
+        Return the payload buffer size in bytes.
+
+        Raises
+        ------
+        ValueError
+            If the PackedData is empty.
+        """
+        if not self.c_obj:
+            raise ValueError("PackedData is empty")
+
+        cdef size_t result
+        with nogil:
+            result = cpp_packed_data_data_size(self.c_obj.get())
+        return result
 
 
 # Convert a vector of `cpp_PackedData` into a list of `PackedData`.

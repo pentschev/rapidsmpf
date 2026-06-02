@@ -104,7 +104,10 @@ std::string direction_string(rapidsmpf::ucxx::UCXX::TelemetryEvent::Direction di
 using TelemetryEvent = rapidsmpf::ucxx::UCXX::TelemetryEvent;
 
 void append_transfer_fields(
-    std::ostringstream& ss, TelemetryEvent const& event, std::uint64_t count = 0
+    std::ostringstream& ss,
+    TelemetryEvent const& event,
+    std::uint64_t count = 0,
+    std::string_view sample_debug_string = {}
 ) {
     ss << "\"local_rank\":" << event.local_rank << ",\"peer_rank\":" << event.peer_rank
        << ",\"tag\":" << event.tag
@@ -116,6 +119,9 @@ void append_transfer_fields(
        << ",\"debug_string\":" << json_string(event.debug_string);
     if (count > 0) {
         ss << ",\"count\":" << count;
+    }
+    if (!sample_debug_string.empty()) {
+        ss << ",\"sample_debug_string\":" << json_string(sample_debug_string);
     }
 }
 
@@ -139,16 +145,6 @@ std::string lower_copy(std::string_view value) {
 
 std::string normalized_debug_key(std::string_view debug_string) {
     auto const lower = lower_copy(debug_string);
-    if (lower.find("cuda_ipc") != std::string::npos
-        || lower.find("cuda ipc") != std::string::npos)
-    {
-        return "cuda_ipc";
-    }
-    if (lower.find("cuda_copy") != std::string::npos
-        || lower.find("gdr_copy") != std::string::npos)
-    {
-        return "pcie";
-    }
 
     std::vector<std::string> mlx_devices;
     std::size_t pos = 0;
@@ -177,6 +173,16 @@ std::string normalized_debug_key(std::string_view debug_string) {
         || lower.find("dc_") != std::string::npos)
     {
         return "infiniband";
+    }
+    if (lower.find("cuda_copy") != std::string::npos
+        || lower.find("gdr_copy") != std::string::npos)
+    {
+        return "pcie";
+    }
+    if (lower.find("cuda_ipc") != std::string::npos
+        || lower.find("cuda ipc") != std::string::npos)
+    {
+        return "cuda_ipc";
     }
     return std::string{debug_string};
 }
@@ -596,11 +602,14 @@ function processRank(ev) {
   }
   markLayoutDirty();
 }
+function debugText(ev) {
+  return `${ev.debug_string || ''} ${ev.sample_debug_string || ''}`.toLowerCase();
+}
 function classifyTransfer(ev) {
-  const d = (ev.debug_string || '').toLowerCase();
-  if (d.includes('cuda_ipc') || d.includes('cuda ipc')) return 'cuda_ipc';
-  if (d.includes('cuda_copy') || d.includes('gdr_copy') || d.includes('pcie')) return 'pcie';
+  const d = debugText(ev);
   if (d.includes('infiniband') || d.includes('mlx5') || d.includes('/ib') || d.includes('rc_') || d.includes('dc_')) return 'infiniband';
+  if (d.includes('cuda_copy') || d.includes('gdr_copy') || d.includes('pcie')) return 'pcie';
+  if (d.includes('cuda_ipc') || d.includes('cuda ipc')) return 'cuda_ipc';
   return 'unknown';
 }
 function transportLabel(transport) {
@@ -708,7 +717,7 @@ function cudaIpcRoute(ev) {
   return shortestEdgePath(gpuA, gpuB, 'nvlink');
 }
 function parseMlxDevices(ev) {
-  return Array.from(new Set((ev.debug_string || '').match(/mlx5_\d+/g) || []));
+  return Array.from(new Set(debugText(ev).match(/mlx5_\d+/g) || []));
 }
 function nicNodesByName(name) {
   return Array.from(state.nodes.values()).filter(node =>
@@ -1475,6 +1484,7 @@ class TelemetryBatcher::Impl {
     struct Bucket {
         TelemetryEvent event{};
         std::uint64_t count{0};
+        std::string sample_debug_string;
     };
 
     static std::string key_for(
@@ -1492,6 +1502,7 @@ class TelemetryBatcher::Impl {
         auto& bucket = buckets_[key_for(event, debug_key)];
         if (bucket.count == 0) {
             bucket.event = event;
+            bucket.sample_debug_string = event.debug_string;
             bucket.event.debug_string = std::move(debug_key);
         } else {
             auto& aggregate = bucket.event;
@@ -1533,7 +1544,9 @@ class TelemetryBatcher::Impl {
             }
             first = false;
             ss << '{';
-            append_transfer_fields(ss, bucket.event, bucket.count);
+            append_transfer_fields(
+                ss, bucket.event, bucket.count, bucket.sample_debug_string
+            );
             ss << '}';
         }
         ss << "]}";

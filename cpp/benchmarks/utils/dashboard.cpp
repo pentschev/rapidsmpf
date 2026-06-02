@@ -103,6 +103,15 @@ std::string direction_string(rapidsmpf::ucxx::UCXX::TelemetryEvent::Direction di
 
 using TelemetryEvent = rapidsmpf::ucxx::UCXX::TelemetryEvent;
 
+struct TransportFlags {
+    bool cuda_ipc{false};
+    bool pcie{false};
+    bool infiniband{false};
+};
+
+TransportFlags transport_flags(std::string_view debug_string);
+char const* json_bool(bool value);
+
 void append_transfer_fields(
     std::ostringstream& ss,
     TelemetryEvent const& event,
@@ -123,6 +132,13 @@ void append_transfer_fields(
     if (!sample_debug_string.empty()) {
         ss << ",\"sample_debug_string\":" << json_string(sample_debug_string);
     }
+    auto const flags = transport_flags(
+        sample_debug_string.empty() ? std::string_view{event.debug_string}
+                                    : sample_debug_string
+    );
+    ss << ",\"transport_flags\":{\"cuda_ipc\":" << json_bool(flags.cuda_ipc)
+       << ",\"pcie\":" << json_bool(flags.pcie)
+       << ",\"infiniband\":" << json_bool(flags.infiniband) << "}";
 }
 
 std::string transfer_json(TelemetryEvent const& event) {
@@ -141,6 +157,26 @@ std::string lower_copy(std::string_view value) {
         out.push_back(static_cast<char>(std::tolower(uc)));
     }
     return out;
+}
+
+TransportFlags transport_flags(std::string_view debug_string) {
+    auto const lower = lower_copy(debug_string);
+    return TransportFlags{
+        .cuda_ipc = lower.find("cuda_ipc") != std::string::npos
+                    || lower.find("cuda ipc") != std::string::npos,
+        .pcie = lower.find("cuda_copy") != std::string::npos
+                || lower.find("gdr_copy") != std::string::npos
+                || lower.find("pcie") != std::string::npos,
+        .infiniband = lower.find("infiniband") != std::string::npos
+                      || lower.find("mlx5") != std::string::npos
+                      || lower.find("/ib") != std::string::npos
+                      || lower.find("rc_") != std::string::npos
+                      || lower.find("dc_") != std::string::npos
+    };
+}
+
+char const* json_bool(bool value) {
+    return value ? "true" : "false";
 }
 
 std::string normalized_debug_key(std::string_view debug_string) {

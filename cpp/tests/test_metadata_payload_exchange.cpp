@@ -3,6 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cstring>
+#include <deque>
+#include <stdexcept>
+#include <unordered_map>
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -21,6 +26,149 @@
 
 using namespace rapidsmpf;
 using namespace rapidsmpf::communicator;
+
+namespace {
+
+class RecordingMetadataCommunicator final : public Communicator {
+  public:
+    class Future final : public Communicator::Future {};
+
+    RecordingMetadataCommunicator(Rank rank, Rank nranks)
+        : rank_{rank},
+          nranks_{nranks},
+          logger_{std::make_shared<Communicator::Logger>(rank, config::Options{})} {}
+
+    void enqueue_metadata(Rank src, std::uint64_t message_id, std::size_t payload_size) {
+        auto metadata =
+            std::vector<std::uint8_t>(sizeof(std::uint64_t) + sizeof(std::size_t));
+        std::memcpy(metadata.data(), &message_id, sizeof(std::uint64_t));
+        std::memcpy(
+            metadata.data() + sizeof(std::uint64_t), &payload_size, sizeof(std::size_t)
+        );
+        metadata_by_src_[src].push_back(std::move(metadata));
+    }
+
+    [[nodiscard]] std::vector<Rank> const& data_receive_sources() const noexcept {
+        return data_receive_sources_;
+    }
+
+    [[nodiscard]] Rank rank() const override {
+        return rank_;
+    }
+
+    [[nodiscard]] Rank nranks() const override {
+        return nranks_;
+    }
+
+    [[nodiscard]] std::unique_ptr<Communicator::Future> send(
+        std::unique_ptr<std::vector<std::uint8_t>>, Rank, Tag
+    ) override {
+        throw std::runtime_error("unexpected send");
+    }
+
+    [[nodiscard]] std::unique_ptr<Communicator::Future> send(
+        std::unique_ptr<Buffer>, Rank, Tag
+    ) override {
+        throw std::runtime_error("unexpected send");
+    }
+
+    [[nodiscard]] std::unique_ptr<Communicator::Future> recv(
+        Rank rank, Tag, std::unique_ptr<Buffer>
+    ) override {
+        data_receive_sources_.push_back(rank);
+        return std::make_unique<Future>();
+    }
+
+    [[nodiscard]] std::unique_ptr<Communicator::Future> recv_sync_host_data(
+        Rank, Tag, std::unique_ptr<std::vector<std::uint8_t>>
+    ) override {
+        throw std::runtime_error("unexpected recv_sync_host_data");
+    }
+
+    [[nodiscard]] std::pair<std::unique_ptr<std::vector<std::uint8_t>>, Rank> recv_any(
+        Tag
+    ) override {
+        throw std::runtime_error("unexpected recv_any");
+    }
+
+    [[nodiscard]] std::unique_ptr<std::vector<std::uint8_t>> recv_from(
+        Rank src, Tag
+    ) override {
+        auto source_it = metadata_by_src_.find(src);
+        if (source_it == metadata_by_src_.end() || source_it->second.empty()) {
+            return nullptr;
+        }
+
+        auto metadata = std::make_unique<std::vector<std::uint8_t>>(
+            std::move(source_it->second.front())
+        );
+        source_it->second.pop_front();
+        return metadata;
+    }
+
+    [[nodiscard]] std::
+        pair<std::vector<std::unique_ptr<Communicator::Future>>, std::vector<std::size_t>>
+        test_some(std::vector<std::unique_ptr<Communicator::Future>>&) override {
+        return {};
+    }
+
+    [[nodiscard]] std::vector<std::size_t> test_some(
+        std::unordered_map<std::size_t, std::unique_ptr<Communicator::Future>> const&
+    ) override {
+        return {};
+    }
+
+    [[nodiscard]] bool test(std::unique_ptr<Communicator::Future>&) override {
+        return false;
+    }
+
+    [[nodiscard]] std::vector<std::unique_ptr<Buffer>> wait_all(
+        std::vector<std::unique_ptr<Communicator::Future>>&&
+    ) override {
+        throw std::runtime_error("unexpected wait_all");
+    }
+
+    [[nodiscard]] std::unique_ptr<Buffer> wait(
+        std::unique_ptr<Communicator::Future>
+    ) override {
+        throw std::runtime_error("unexpected wait");
+    }
+
+    [[nodiscard]] std::unique_ptr<Buffer> release_data(
+        std::unique_ptr<Communicator::Future>
+    ) override {
+        throw std::runtime_error("unexpected release_data");
+    }
+
+    [[nodiscard]] std::unique_ptr<std::vector<std::uint8_t>> release_sync_host_data(
+        std::unique_ptr<Communicator::Future>
+    ) override {
+        throw std::runtime_error("unexpected release_sync_host_data");
+    }
+
+    [[nodiscard]] std::shared_ptr<Communicator::Logger> const& logger() override {
+        return logger_;
+    }
+
+    [[nodiscard]] std::shared_ptr<ProgressThread> const&
+    progress_thread() const override {
+        return progress_thread_;
+    }
+
+    [[nodiscard]] std::string str() const override {
+        return "RecordingMetadataCommunicator";
+    }
+
+  private:
+    Rank rank_;
+    Rank nranks_;
+    std::shared_ptr<Communicator::Logger> logger_;
+    std::shared_ptr<ProgressThread> progress_thread_;
+    std::unordered_map<Rank, std::deque<std::vector<std::uint8_t>>> metadata_by_src_;
+    std::vector<Rank> data_receive_sources_;
+};
+
+}  // namespace
 
 class MetadataPayloadExchangeTest : public ::testing::Test {
   protected:
@@ -105,6 +253,36 @@ class MetadataPayloadExchangeTest : public ::testing::Test {
     std::shared_ptr<Statistics> statistics;
     std::unique_ptr<TagMetadataPayloadExchange> comm_interface;
 };
+
+TEST(MetadataPayloadExchangeSchedulerTest, PostsPayloadReceivesInBalancedSourceRounds) {
+    auto comm = std::make_shared<RecordingMetadataCommunicator>(Rank{0}, Rank{4});
+
+    auto enqueue_payload_messages = [&](Rank src, int count) {
+        for (int i = 0; i < count; ++i) {
+            auto message_id =
+                (static_cast<std::uint64_t>(src) << 32) | static_cast<std::uint64_t>(i);
+            comm->enqueue_metadata(src, message_id, std::size_t{1});
+        }
+    };
+
+    enqueue_payload_messages(Rank{1}, 3);
+    enqueue_payload_messages(Rank{2}, 2);
+    enqueue_payload_messages(Rank{3}, 1);
+
+    TagMetadataPayloadExchange exchange(
+        comm,
+        OpID{42},
+        [](std::size_t) -> std::unique_ptr<Buffer> { return nullptr; },
+        Statistics::create()
+    );
+
+    exchange.progress();
+
+    EXPECT_THAT(
+        comm->data_receive_sources(),
+        testing::ElementsAre(Rank{1}, Rank{2}, Rank{3}, Rank{1}, Rank{2}, Rank{1})
+    );
+}
 
 TEST_F(MetadataPayloadExchangeTest, InitialState) {
     // Communication interface should start in idle state

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <unordered_set>
 #include <utility>
 
@@ -273,15 +274,17 @@ TagMetadataPayloadExchange::setup_data_receives() {
 
     std::vector<std::unique_ptr<MetadataPayloadExchange::Message>> completed_messages;
 
-    // Process messages per rank, breaking only when a rank's buffer isn't ready
-    for (auto rank_it = incoming_messages_.begin(); rank_it != incoming_messages_.end();)
-    {
-        auto& [src, messages] = *rank_it;
+    struct SourceProgress {
+        bool made_progress{false};
+        bool blocked{false};
+    };
 
-        // Process messages for this rank in order
-        auto msg_it = messages.begin();
-        while (msg_it != messages.end()) {
-            auto& tag_msg = *msg_it;
+    auto setup_next_receive_from_source =
+        [&](Rank src, std::deque<TagMessage>& messages) -> SourceProgress {
+        SourceProgress progress;
+
+        while (!messages.empty()) {
+            auto& tag_msg = messages.front();
             log->trace(
                 "checking incoming message data from ",
                 src,
@@ -293,18 +296,19 @@ TagMetadataPayloadExchange::setup_data_receives() {
             std::size_t payload_size = tag_msg.expected_payload_size;
 
             if (payload_size > 0) {
-                // Check if the buffer is ready for use, if not, break for this rank
+                // Check if the buffer is ready for use, if not, stop for this rank
                 // and wait for the buffer to be ready. This is necessary to ensure
                 // messages are received in the order they are sent from this rank.
                 if (tag_msg.message->data()
                     && !tag_msg.message->data()->is_latest_write_done())
                 {
-                    break;
+                    progress.blocked = true;
+                    return progress;
                 }
 
                 // Extract the message and set up for data transfer
                 auto tag_message = std::move(tag_msg);
-                msg_it = messages.erase(msg_it);
+                messages.pop_front();
 
                 auto data_buffer = tag_message.message->release_data();
                 auto future = comm_->recv(src, gpu_data_tag_, std::move(data_buffer));
@@ -314,33 +318,70 @@ TagMetadataPayloadExchange::setup_data_receives() {
                     in_transit_futures_.emplace(message_id, std::move(future)).second,
                     "in transit future already exists"
                 );
-                // Store in per-rank vector to maintain order
+                // Store in per-rank queue to maintain order
                 in_transit_messages_[src].push_back(std::move(tag_message));
-                // Break to ensure we don't return later messages before this one
-                // completes
-                break;
+                progress.made_progress = true;
+                return progress;
             } else {
-                // Control/metadata-only message
-                // Only return if there are no earlier in-transit messages from this rank
-                if (in_transit_messages_.count(src) == 0
-                    || in_transit_messages_[src].empty())
+                // Control/metadata-only message. Only return if there are no
+                // earlier in-transit messages from this rank.
+                auto const in_transit_it = in_transit_messages_.find(src);
+                if (in_transit_it == in_transit_messages_.end()
+                    || in_transit_it->second.empty())
                 {
                     completed_messages.push_back(std::move(tag_msg.message));
-                    msg_it = messages.erase(msg_it);
+                    messages.pop_front();
+                    progress.made_progress = true;
                 } else {
-                    // There are earlier messages still in transit, stop processing this
-                    // rank
-                    break;
+                    // There are earlier messages still in transit, stop processing
+                    // this rank.
+                    progress.blocked = true;
+                    return progress;
                 }
             }
         }
 
-        // Remove rank entry if all messages have been processed
-        if (messages.empty()) {
-            rank_it = incoming_messages_.erase(rank_it);
-        } else {
-            ++rank_it;
+        return progress;
+    };
+
+    std::vector<Rank> active_sources;
+    active_sources.reserve(incoming_messages_.size());
+    for (auto const& [src, messages] : incoming_messages_) {
+        if (!messages.empty()) {
+            active_sources.push_back(src);
         }
+    }
+    std::sort(active_sources.begin(), active_sources.end());
+
+    // Post pending payload receives in balanced source rounds. Within one round, each
+    // ready source gets at most one posted receive before any ready source is
+    // considered again. Sources blocked by buffer readiness or per-source ordering are
+    // retried by the next progress call.
+    while (!active_sources.empty()) {
+        bool made_round_progress = false;
+        std::vector<Rank> next_round_sources;
+        next_round_sources.reserve(active_sources.size());
+
+        for (auto src : active_sources) {
+            auto rank_it = incoming_messages_.find(src);
+            if (rank_it == incoming_messages_.end() || rank_it->second.empty()) {
+                continue;
+            }
+
+            auto progress = setup_next_receive_from_source(src, rank_it->second);
+            made_round_progress = made_round_progress || progress.made_progress;
+
+            if (rank_it->second.empty()) {
+                incoming_messages_.erase(rank_it);
+            } else if (!progress.blocked) {
+                next_round_sources.push_back(src);
+            }
+        }
+
+        if (!made_round_progress) {
+            break;
+        }
+        active_sources = std::move(next_round_sources);
     }
 
     statistics_->add_duration_stat(
@@ -387,7 +428,7 @@ TagMetadataPayloadExchange::complete_data_transfers() {
                     completed_messages.push_back(std::move(tag_msg.message));
 
                     in_transit_futures_.erase(future_it);
-                    messages.erase(messages.begin());
+                    messages.pop_front();
                 } else {
                     // First message not complete yet, stop processing this rank
                     // to maintain order

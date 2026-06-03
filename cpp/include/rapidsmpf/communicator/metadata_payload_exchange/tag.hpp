@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -131,9 +132,9 @@ class TagMetadataPayloadExchange : public MetadataPayloadExchange {
     // Communication state containers
     std::vector<std::unique_ptr<Communicator::Future>>
         fire_and_forget_;  ///< Ongoing "fire-and-forget" operations (non-blocking sends).
-    std::unordered_map<Rank, std::vector<TagMessage>>
+    std::unordered_map<Rank, std::deque<TagMessage>>
         incoming_messages_;  ///< Messages ready to be received, grouped by rank.
-    std::unordered_map<Rank, std::vector<TagMessage>>
+    std::unordered_map<Rank, std::deque<TagMessage>>
         in_transit_messages_;  ///< Messages currently in transit, grouped by rank in
                                ///< order.
     std::unordered_map<std::uint64_t, std::unique_ptr<Communicator::Future>>

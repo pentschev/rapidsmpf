@@ -4,8 +4,20 @@
  */
 
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <iostream>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
+#include <getopt.h>
 #include <mpi.h>
 
 #include <rmm/cuda_stream_pool.hpp>
@@ -22,6 +34,7 @@
 #include <rapidsmpf/memory/pinned_memory_resource.hpp>
 #include <rapidsmpf/progress_thread.hpp>
 #include <rapidsmpf/statistics.hpp>
+#include <rapidsmpf/utils/misc.hpp>
 #include <rapidsmpf/utils/string.hpp>
 
 #ifdef RAPIDSMPF_HAVE_CUPTI
@@ -34,6 +47,147 @@
 
 
 using namespace rapidsmpf;
+
+enum class PostOrder : std::uint8_t {
+    RankMajor,
+    Balanced,
+    BalancedInterleaved
+};
+
+enum class TagMode : std::uint8_t {
+    Constant,
+    PerCopy,
+    PerRound
+};
+
+enum class CompletionMode : std::uint8_t {
+    Ordered,
+    Unordered
+};
+
+enum class ProgressDuringPost : std::uint8_t {
+    None,
+    Request,
+    Direction,
+    Round,
+    Operation
+};
+
+PostOrder parse_post_order(std::string const& value) {
+    if (value == "rank-major" || value == "major" || value == "device-major") {
+        return PostOrder::RankMajor;
+    }
+    if (value == "balanced" || value == "round-robin") {
+        return PostOrder::Balanced;
+    }
+    if (value == "balanced-interleaved" || value == "round-robin-interleaved"
+        || value == "interleaved")
+    {
+        return PostOrder::BalancedInterleaved;
+    }
+    throw std::invalid_argument(
+        "-P/--post-order must be one of {rank-major, balanced, balanced-interleaved}"
+    );
+}
+
+std::string to_string(PostOrder order) {
+    switch (order) {
+    case PostOrder::RankMajor:
+        return "rank-major";
+    case PostOrder::Balanced:
+        return "balanced";
+    case PostOrder::BalancedInterleaved:
+        return "balanced-interleaved";
+    }
+    RAPIDSMPF_FAIL("unknown post order", std::invalid_argument);
+}
+
+TagMode parse_tag_mode(std::string const& value) {
+    if (value == "constant" || value == "single") {
+        return TagMode::Constant;
+    }
+    if (value == "per-copy" || value == "copy" || value == "unique") {
+        return TagMode::PerCopy;
+    }
+    if (value == "per-round" || value == "round") {
+        return TagMode::PerRound;
+    }
+    throw std::invalid_argument(
+        "-T/--tag-mode must be one of {constant, per-copy, per-round}"
+    );
+}
+
+std::string to_string(TagMode mode) {
+    switch (mode) {
+    case TagMode::Constant:
+        return "constant";
+    case TagMode::PerCopy:
+        return "per-copy";
+    case TagMode::PerRound:
+        return "per-round";
+    }
+    RAPIDSMPF_FAIL("unknown tag mode", std::invalid_argument);
+}
+
+CompletionMode parse_completion_mode(std::string const& value) {
+    if (value == "ordered" || value == "vector") {
+        return CompletionMode::Ordered;
+    }
+    if (value == "unordered" || value == "map") {
+        return CompletionMode::Unordered;
+    }
+    throw std::invalid_argument(
+        "-W/--completion-mode must be one of {ordered, unordered}"
+    );
+}
+
+std::string to_string(CompletionMode mode) {
+    switch (mode) {
+    case CompletionMode::Ordered:
+        return "ordered";
+    case CompletionMode::Unordered:
+        return "unordered";
+    }
+    RAPIDSMPF_FAIL("unknown completion mode", std::invalid_argument);
+}
+
+ProgressDuringPost parse_progress_during_post(std::string const& value) {
+    if (value == "none" || value == "off" || value == "disabled") {
+        return ProgressDuringPost::None;
+    }
+    if (value == "request" || value == "copy" || value == "post") {
+        return ProgressDuringPost::Request;
+    }
+    if (value == "direction") {
+        return ProgressDuringPost::Direction;
+    }
+    if (value == "round") {
+        return ProgressDuringPost::Round;
+    }
+    if (value == "operation" || value == "op") {
+        return ProgressDuringPost::Operation;
+    }
+    throw std::invalid_argument(
+        "--progress-during-post must be one of {none, request, direction, round, "
+        "operation}"
+    );
+}
+
+std::string to_string(ProgressDuringPost mode) {
+    switch (mode) {
+    case ProgressDuringPost::None:
+        return "none";
+    case ProgressDuringPost::Request:
+        return "request";
+    case ProgressDuringPost::Direction:
+        return "direction";
+    case ProgressDuringPost::Round:
+        return "round";
+    case ProgressDuringPost::Operation:
+        return "operation";
+    }
+    RAPIDSMPF_FAIL("unknown progress-during-post mode", std::invalid_argument);
+}
 
 class ArgumentParser {
   public:
@@ -52,7 +206,24 @@ class ArgumentParser {
 
         try {
             int option;
-            while ((option = getopt(argc, argv, "hC:O:r:w:n:p:m:M:")) != -1) {
+            struct option long_options[] = {
+                {"post-order", required_argument, nullptr, 'P'},
+                {"post-mode", required_argument, nullptr, 'P'},
+                {"tag-mode", required_argument, nullptr, 'T'},
+                {"completion-mode", required_argument, nullptr, 'W'},
+                {"wait-mode", required_argument, nullptr, 'W'},
+                {"progress-during-post", required_argument, nullptr, 'G'},
+                {nullptr, 0, nullptr, 0}
+            };
+#ifdef RAPIDSMPF_HAVE_CUPTI
+            char const* option_string = "hC:O:r:w:n:p:m:P:T:W:G:M:";
+#else
+            char const* option_string = "hC:O:r:w:n:p:m:P:T:W:G:";
+#endif
+            while ((option =
+                        getopt_long(argc, argv, option_string, long_options, nullptr))
+                   != -1)
+            {
                 switch (option) {
                 case 'h':
                     {
@@ -72,6 +243,21 @@ class ArgumentParser {
                               "(default: pool)\n"
                            << "  -r <num>   Number of runs (default: 1)\n"
                            << "  -w <num>   Number of warmup runs (default: 0)\n"
+                           << "  -P, --post-order <order>\n"
+                           << "             Posting order {rank-major, balanced, "
+                              "balanced-interleaved} "
+                              "(default: rank-major)\n"
+                           << "  -T, --tag-mode <mode>\n"
+                           << "             Tag assignment {constant, per-copy, "
+                              "per-round} "
+                              "(default: constant)\n"
+                           << "  -W, --completion-mode <mode>\n"
+                           << "             Completion polling {ordered, unordered} "
+                              "(default: ordered)\n"
+                           << "  -G, --progress-during-post <mode>\n"
+                           << "             UCXX progress while posting {none, request, "
+                              "direction, round, operation} "
+                              "(default: none)\n"
 #ifdef RAPIDSMPF_HAVE_CUPTI
                            << "  -M <path>  Enable CUPTI memory monitoring and save CSV "
                               "files with given path prefix. For example, /tmp/test will "
@@ -133,6 +319,19 @@ class ArgumentParser {
                 case 'w':
                     parse_integer(num_warmups, optarg);
                     break;
+                case 'P':
+                    post_order = parse_post_order(std::string{optarg});
+                    break;
+                case 'T':
+                    tag_mode = parse_tag_mode(std::string{optarg});
+                    break;
+                case 'W':
+                    completion_mode = parse_completion_mode(std::string{optarg});
+                    break;
+                case 'G':
+                    progress_during_post =
+                        parse_progress_during_post(std::string{optarg});
+                    break;
 #ifdef RAPIDSMPF_HAVE_CUPTI
                 case 'M':
                     cupti_csv_prefix = std::string{optarg};
@@ -187,6 +386,10 @@ class ArgumentParser {
         ss << "  -p " << num_ops << " (number of operations)\n";
         ss << "  -r " << num_runs << " (number of runs)\n";
         ss << "  -w " << num_warmups << " (number of warmup runs)\n";
+        ss << "  -P " << to_string(post_order) << " (posting order)\n";
+        ss << "  -T " << to_string(tag_mode) << " (tag mode)\n";
+        ss << "  -W " << to_string(completion_mode) << " (completion mode)\n";
+        ss << "  -G " << to_string(progress_during_post) << " (progress during post)\n";
         ss << "  -m " << rmm_mr << " (RMM memory resource)\n";
         if (enable_cupti_monitoring) {
             ss << "  -M " << cupti_csv_prefix << " (CUPTI memory monitoring enabled)\n";
@@ -201,64 +404,644 @@ class ArgumentParser {
     std::string operation{"all-to-all"};
     std::uint64_t msg_size{1 << 20};
     std::uint64_t num_ops{1};
+    PostOrder post_order{PostOrder::RankMajor};
+    TagMode tag_mode{TagMode::Constant};
+    CompletionMode completion_mode{CompletionMode::Ordered};
+    ProgressDuringPost progress_during_post{ProgressDuringPost::None};
     bool enable_cupti_monitoring{false};
     std::string cupti_csv_prefix;
 };
 
-Duration run(
-    std::shared_ptr<Communicator> comm,
-    ArgumentParser const& args,
-    rmm::cuda_stream_view stream,
-    BufferResource* br,
-    std::shared_ptr<rapidsmpf::Statistics> statistics
-) {
-    // Allocate send and recv buffers and fill the send buffers with random data.
+struct BufferSet {
     std::vector<std::unique_ptr<Buffer>> send_bufs;
     std::vector<std::unique_ptr<Buffer>> recv_bufs;
+};
+
+struct FutureSlot {
+    enum class Kind : std::uint8_t {
+        Send,
+        Recv
+    };
+
+    Kind kind;
+    std::uint64_t index;
+};
+
+void barrier(std::shared_ptr<Communicator> const& comm) {
+    bool const use_bootstrap = rapidsmpf::bootstrap::is_running_with_rrun();
+    if (!use_bootstrap) {
+        RAPIDSMPF_MPI(MPI_Barrier(MPI_COMM_WORLD));
+        return;
+    }
+
+    auto ucxx_comm = std::dynamic_pointer_cast<rapidsmpf::ucxx::UCXX>(comm);
+    RAPIDSMPF_EXPECTS(
+        ucxx_comm != nullptr, "rrun benchmark requires a UCXX communicator"
+    );
+    ucxx_comm->barrier();
+}
+
+std::uint64_t buffer_index(Communicator const& comm, std::uint64_t i, Rank rank) {
+    return static_cast<std::uint64_t>(rank)
+           + i * static_cast<std::uint64_t>(comm.nranks());
+}
+
+std::uint64_t rank_pair_index(Rank nranks, Rank src, Rank dst) {
+    RAPIDSMPF_EXPECTS(src >= 0 && src < nranks, "invalid source rank");
+    RAPIDSMPF_EXPECTS(dst >= 0 && dst < nranks, "invalid destination rank");
+    auto const rank_count = rapidsmpf::safe_cast<std::uint64_t>(nranks);
+    return rapidsmpf::safe_cast<std::uint64_t>(src) * rank_count
+           + rapidsmpf::safe_cast<std::uint64_t>(dst);
+}
+
+Tag make_linear_tag(std::uint64_t op_id) {
+    auto constexpr max_op_id = std::uint64_t{1} << Tag::op_id_bits;
+    RAPIDSMPF_EXPECTS(
+        op_id < max_op_id,
+        "tag mode requires more distinct tags than RAPIDSMPF Tag can represent",
+        std::overflow_error
+    );
+    return Tag{rapidsmpf::safe_cast<OpID>(op_id), StageID{0}};
+}
+
+Tag make_message_tag(
+    ArgumentParser const& args,
+    Rank nranks,
+    std::uint64_t op,
+    Rank src,
+    Rank dst,
+    std::uint64_t round,
+    std::uint64_t direction
+) {
+    switch (args.tag_mode) {
+    case TagMode::Constant:
+        return Tag{OpID{0}, StageID{0}};
+    case TagMode::PerCopy:
+        {
+            auto const rank_count = rapidsmpf::safe_cast<std::uint64_t>(nranks);
+            auto const tags_per_op = rank_count * rank_count;
+            return make_linear_tag(
+                std::uint64_t{1} + op * tags_per_op + rank_pair_index(nranks, src, dst)
+            );
+        }
+    case TagMode::PerRound:
+        {
+            if (args.post_order == PostOrder::RankMajor) {
+                auto const rank_count = rapidsmpf::safe_cast<std::uint64_t>(nranks);
+                auto const tags_per_op = rank_count * rank_count;
+                return make_linear_tag(
+                    std::uint64_t{1} + op * tags_per_op
+                    + rank_pair_index(nranks, src, dst)
+                );
+            }
+            auto const rank_count = rapidsmpf::safe_cast<std::uint64_t>(nranks);
+            auto const participant_count = rank_count + (rank_count % 2);
+            auto const rounds_per_op = participant_count > 1 ? participant_count - 1 : 1;
+            auto const tags_per_op = rounds_per_op * std::uint64_t{2};
+            RAPIDSMPF_EXPECTS(direction < 2, "invalid balanced direction");
+            RAPIDSMPF_EXPECTS(round < rounds_per_op, "invalid balanced round");
+            return make_linear_tag(
+                std::uint64_t{1} + op * tags_per_op + round * std::uint64_t{2} + direction
+            );
+        }
+    }
+    RAPIDSMPF_FAIL("unknown tag mode", std::invalid_argument);
+}
+
+void progress_communicator(Communicator& comm) {
+    auto* ucxx_comm = dynamic_cast<rapidsmpf::ucxx::UCXX*>(&comm);
+    if (ucxx_comm != nullptr) {
+        ucxx_comm->progress();
+    }
+}
+
+void progress_after(
+    Communicator& comm, ArgumentParser const& args, ProgressDuringPost point
+) {
+    if (args.progress_during_post == point) {
+        progress_communicator(comm);
+    }
+}
+
+using RankPair = std::pair<Rank, Rank>;
+using PairRound = std::vector<RankPair>;
+
+std::vector<std::size_t> initial_round_robin_slots(std::size_t nranks) {
+    if (nranks == 0) {
+        return {};
+    }
+
+    auto const participant_count = nranks + (nranks % 2);
+    std::vector<std::size_t> slots;
+    slots.reserve(participant_count);
+
+    for (std::size_t i = 0; i < participant_count; i += 2) {
+        slots.push_back(i);
+    }
+    for (std::size_t i = participant_count; i > 1; i -= 2) {
+        slots.push_back(i - 1);
+    }
+    return slots;
+}
+
+std::vector<PairRound> round_robin_pair_rounds(Rank nranks) {
+    auto const rank_count = rapidsmpf::safe_cast<std::size_t>(nranks);
+    if (rank_count < 2) {
+        return {};
+    }
+
+    auto const participant_count = rank_count + (rank_count % 2);
+    auto slots = initial_round_robin_slots(rank_count);
+    std::vector<PairRound> rounds;
+    rounds.reserve(participant_count - 1);
+
+    for (std::size_t round = 0; round < participant_count - 1; ++round) {
+        PairRound pairs;
+        pairs.reserve(participant_count / 2);
+        for (std::size_t slot = 0; slot < participant_count / 2; ++slot) {
+            auto const first = slots.at(slot);
+            auto const second = slots.at(participant_count - 1 - slot);
+            if (first < rank_count && second < rank_count) {
+                pairs.emplace_back(
+                    rapidsmpf::safe_cast<Rank>(first), rapidsmpf::safe_cast<Rank>(second)
+                );
+            }
+        }
+        rounds.push_back(std::move(pairs));
+
+        auto const last = slots.back();
+        for (std::size_t i = participant_count - 1; i > 1; --i) {
+            slots.at(i) = slots.at(i - 1);
+        }
+        slots.at(1) = last;
+    }
+    return rounds;
+}
+
+BufferSet allocate_buffers(
+    std::shared_ptr<Communicator> const& comm,
+    ArgumentParser const& args,
+    rmm::cuda_stream_view stream,
+    BufferResource* br
+) {
+    BufferSet buffers;
+    auto const buffer_count = args.num_ops * static_cast<std::uint64_t>(comm->nranks());
+    buffers.send_bufs.reserve(buffer_count);
+    buffers.recv_bufs.reserve(buffer_count);
     for (std::uint64_t i = 0; i < args.num_ops; ++i) {
         for (Rank rank = 0; rank < comm->nranks(); ++rank) {
             auto [res, _] =
                 br->reserve(MemoryType::DEVICE, args.msg_size * 2, AllowOverbooking::YES);
             auto buf = br->make_buffer(args.msg_size, stream, res);
             random_fill(*buf, br->device_mr());
-            send_bufs.push_back(std::move(buf));
-            recv_bufs.push_back(br->make_buffer(args.msg_size, stream, res));
+            buffers.send_bufs.push_back(std::move(buf));
+            buffers.recv_bufs.push_back(br->make_buffer(args.msg_size, stream, res));
         }
     }
+    return buffers;
+}
 
+void post_recv(
+    Communicator& comm,
+    ArgumentParser const& args,
+    rapidsmpf::Statistics& statistics,
+    Tag tag,
+    std::uint64_t op,
+    Rank peer,
+    BufferSet& buffers,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots
+) {
+    auto const idx = buffer_index(comm, op, peer);
+    auto buf = std::move(buffers.recv_bufs.at(idx));
+    RAPIDSMPF_EXPECTS(buf != nullptr, "recv buffer slot is empty");
+    statistics.add_bytes_stat("all-to-all-recv", buf->size);
+    futures.push_back(comm.recv(peer, tag, std::move(buf)));
+    future_slots.push_back({FutureSlot::Kind::Recv, idx});
+    progress_after(comm, args, ProgressDuringPost::Request);
+}
+
+void post_send(
+    Communicator& comm,
+    ArgumentParser const& args,
+    rapidsmpf::Statistics& statistics,
+    Tag tag,
+    std::uint64_t op,
+    Rank peer,
+    BufferSet& buffers,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots
+) {
+    auto const idx = buffer_index(comm, op, peer);
+    auto buf = std::move(buffers.send_bufs.at(idx));
+    RAPIDSMPF_EXPECTS(buf != nullptr, "send buffer slot is empty");
+    statistics.add_bytes_stat("all-to-all-send", buf->size);
+    futures.push_back(comm.send(std::move(buf), peer, tag));
+    future_slots.push_back({FutureSlot::Kind::Send, idx});
+    progress_after(comm, args, ProgressDuringPost::Request);
+}
+
+void post_rank_major_copies(
+    Communicator& comm,
+    ArgumentParser const& args,
+    rapidsmpf::Statistics& statistics,
+    BufferSet& buffers,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots
+) {
+    for (std::uint64_t i = 0; i < args.num_ops; ++i) {
+        for (Rank rank = 0; rank < comm.nranks(); ++rank) {
+            if (rank != comm.rank()) {
+                auto const tag = make_message_tag(
+                    args,
+                    comm.nranks(),
+                    i,
+                    rank,
+                    comm.rank(),
+                    rank_pair_index(comm.nranks(), rank, comm.rank()),
+                    0
+                );
+                post_recv(
+                    comm, args, statistics, tag, i, rank, buffers, futures, future_slots
+                );
+            }
+        }
+        progress_after(comm, args, ProgressDuringPost::Direction);
+        for (Rank rank = 0; rank < comm.nranks(); ++rank) {
+            if (rank != comm.rank()) {
+                auto const tag = make_message_tag(
+                    args,
+                    comm.nranks(),
+                    i,
+                    comm.rank(),
+                    rank,
+                    rank_pair_index(comm.nranks(), comm.rank(), rank),
+                    0
+                );
+                post_send(
+                    comm, args, statistics, tag, i, rank, buffers, futures, future_slots
+                );
+            }
+        }
+        progress_after(comm, args, ProgressDuringPost::Direction);
+        progress_after(comm, args, ProgressDuringPost::Operation);
+    }
+}
+
+void post_balanced_recvs(
+    Communicator& comm,
+    ArgumentParser const& args,
+    rapidsmpf::Statistics& statistics,
+    std::uint64_t op,
+    std::vector<PairRound> const& rounds,
+    BufferSet& buffers,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots
+) {
+    for (std::size_t round_idx = 0; round_idx < rounds.size(); ++round_idx) {
+        auto const& round = rounds.at(round_idx);
+        for (auto const& [src, dst] : round) {
+            if (comm.rank() == dst) {
+                auto const tag = make_message_tag(
+                    args,
+                    comm.nranks(),
+                    op,
+                    src,
+                    dst,
+                    rapidsmpf::safe_cast<std::uint64_t>(round_idx),
+                    0
+                );
+                post_recv(
+                    comm, args, statistics, tag, op, src, buffers, futures, future_slots
+                );
+            }
+        }
+        progress_after(comm, args, ProgressDuringPost::Direction);
+        for (auto const& [dst, src] : round) {
+            if (comm.rank() == dst) {
+                auto const tag = make_message_tag(
+                    args,
+                    comm.nranks(),
+                    op,
+                    src,
+                    dst,
+                    rapidsmpf::safe_cast<std::uint64_t>(round_idx),
+                    1
+                );
+                post_recv(
+                    comm, args, statistics, tag, op, src, buffers, futures, future_slots
+                );
+            }
+        }
+        progress_after(comm, args, ProgressDuringPost::Direction);
+        progress_after(comm, args, ProgressDuringPost::Round);
+    }
+}
+
+void post_balanced_sends(
+    Communicator& comm,
+    ArgumentParser const& args,
+    rapidsmpf::Statistics& statistics,
+    std::uint64_t op,
+    std::vector<PairRound> const& rounds,
+    BufferSet& buffers,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots
+) {
+    for (std::size_t round_idx = 0; round_idx < rounds.size(); ++round_idx) {
+        auto const& round = rounds.at(round_idx);
+        for (auto const& [src, dst] : round) {
+            if (comm.rank() == src) {
+                auto const tag = make_message_tag(
+                    args,
+                    comm.nranks(),
+                    op,
+                    src,
+                    dst,
+                    rapidsmpf::safe_cast<std::uint64_t>(round_idx),
+                    0
+                );
+                post_send(
+                    comm, args, statistics, tag, op, dst, buffers, futures, future_slots
+                );
+            }
+        }
+        progress_after(comm, args, ProgressDuringPost::Direction);
+        for (auto const& [dst, src] : round) {
+            if (comm.rank() == src) {
+                auto const tag = make_message_tag(
+                    args,
+                    comm.nranks(),
+                    op,
+                    src,
+                    dst,
+                    rapidsmpf::safe_cast<std::uint64_t>(round_idx),
+                    1
+                );
+                post_send(
+                    comm, args, statistics, tag, op, dst, buffers, futures, future_slots
+                );
+            }
+        }
+        progress_after(comm, args, ProgressDuringPost::Direction);
+        progress_after(comm, args, ProgressDuringPost::Round);
+    }
+}
+
+void post_balanced_copies(
+    Communicator& comm,
+    ArgumentParser const& args,
+    rapidsmpf::Statistics& statistics,
+    BufferSet& buffers,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots
+) {
+    auto const rounds = round_robin_pair_rounds(comm.nranks());
+    for (std::uint64_t i = 0; i < args.num_ops; ++i) {
+        post_balanced_recvs(
+            comm, args, statistics, i, rounds, buffers, futures, future_slots
+        );
+        post_balanced_sends(
+            comm, args, statistics, i, rounds, buffers, futures, future_slots
+        );
+        progress_after(comm, args, ProgressDuringPost::Operation);
+    }
+}
+
+void post_balanced_interleaved_direction_recvs(
+    Communicator& comm,
+    ArgumentParser const& args,
+    rapidsmpf::Statistics& statistics,
+    std::uint64_t op,
+    PairRound const& round,
+    std::uint64_t round_idx,
+    std::uint64_t direction,
+    BufferSet& buffers,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots
+) {
+    for (auto const& [first, second] : round) {
+        auto const src = direction == 0 ? first : second;
+        auto const dst = direction == 0 ? second : first;
+        if (comm.rank() == dst) {
+            auto const tag =
+                make_message_tag(args, comm.nranks(), op, src, dst, round_idx, direction);
+            post_recv(
+                comm, args, statistics, tag, op, src, buffers, futures, future_slots
+            );
+        }
+    }
+}
+
+void post_balanced_interleaved_direction_sends(
+    Communicator& comm,
+    ArgumentParser const& args,
+    rapidsmpf::Statistics& statistics,
+    std::uint64_t op,
+    PairRound const& round,
+    std::uint64_t round_idx,
+    std::uint64_t direction,
+    BufferSet& buffers,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots
+) {
+    for (auto const& [first, second] : round) {
+        auto const src = direction == 0 ? first : second;
+        auto const dst = direction == 0 ? second : first;
+        if (comm.rank() == src) {
+            auto const tag =
+                make_message_tag(args, comm.nranks(), op, src, dst, round_idx, direction);
+            post_send(
+                comm, args, statistics, tag, op, dst, buffers, futures, future_slots
+            );
+        }
+    }
+}
+
+void post_balanced_interleaved_copies(
+    Communicator& comm,
+    ArgumentParser const& args,
+    rapidsmpf::Statistics& statistics,
+    BufferSet& buffers,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots
+) {
+    auto const rounds = round_robin_pair_rounds(comm.nranks());
+    for (std::uint64_t i = 0; i < args.num_ops; ++i) {
+        for (std::size_t round_idx = 0; round_idx < rounds.size(); ++round_idx) {
+            auto const& round = rounds.at(round_idx);
+            auto const round_id = rapidsmpf::safe_cast<std::uint64_t>(round_idx);
+            for (std::uint64_t direction = 0; direction < 2; ++direction) {
+                post_balanced_interleaved_direction_recvs(
+                    comm,
+                    args,
+                    statistics,
+                    i,
+                    round,
+                    round_id,
+                    direction,
+                    buffers,
+                    futures,
+                    future_slots
+                );
+                post_balanced_interleaved_direction_sends(
+                    comm,
+                    args,
+                    statistics,
+                    i,
+                    round,
+                    round_id,
+                    direction,
+                    buffers,
+                    futures,
+                    future_slots
+                );
+                progress_after(comm, args, ProgressDuringPost::Direction);
+            }
+            progress_after(comm, args, ProgressDuringPost::Round);
+        }
+        progress_after(comm, args, ProgressDuringPost::Operation);
+    }
+}
+
+void post_all_copies(
+    Communicator& comm,
+    ArgumentParser const& args,
+    rapidsmpf::Statistics& statistics,
+    BufferSet& buffers,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots
+) {
+    switch (args.post_order) {
+    case PostOrder::RankMajor:
+        post_rank_major_copies(comm, args, statistics, buffers, futures, future_slots);
+        break;
+    case PostOrder::Balanced:
+        post_balanced_copies(comm, args, statistics, buffers, futures, future_slots);
+        break;
+    case PostOrder::BalancedInterleaved:
+        post_balanced_interleaved_copies(
+            comm, args, statistics, buffers, futures, future_slots
+        );
+        break;
+    }
+}
+
+void release_completed_future(
+    Communicator& comm,
+    std::unique_ptr<Communicator::Future> completed,
+    FutureSlot const& slot,
+    BufferSet& buffers
+) {
+    auto buf = comm.release_data(std::move(completed));
+    switch (slot.kind) {
+    case FutureSlot::Kind::Send:
+        buffers.send_bufs.at(slot.index) = std::move(buf);
+        break;
+    case FutureSlot::Kind::Recv:
+        buffers.recv_bufs.at(slot.index) = std::move(buf);
+        break;
+    }
+}
+
+void release_completed_futures_ordered(
+    Communicator& comm,
+    std::vector<std::unique_ptr<Communicator::Future>>&& completed,
+    std::vector<std::size_t> const& indices,
+    std::vector<FutureSlot>& slots,
+    BufferSet& buffers
+) {
+    RAPIDSMPF_EXPECTS(completed.size() == indices.size(), "completed futures mismatch");
+    for (std::size_t i = 0; i < completed.size(); ++i) {
+        auto const slot = slots.at(indices.at(i));
+        release_completed_future(comm, std::move(completed.at(i)), slot, buffers);
+    }
+
+    auto sorted_indices = indices;
+    std::ranges::sort(sorted_indices, std::greater<>{});
+    for (auto index : sorted_indices) {
+        slots.erase(slots.begin() + static_cast<std::ptrdiff_t>(index));
+    }
+}
+
+void wait_for_completion_ordered(
+    Communicator& comm,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots,
+    BufferSet& buffers
+) {
+    while (!futures.empty()) {
+        auto [completed, indices] = comm.test_some(futures);
+        release_completed_futures_ordered(
+            comm, std::move(completed), indices, future_slots, buffers
+        );
+    }
+    RAPIDSMPF_EXPECTS(future_slots.empty(), "all futures completed but slots remain");
+}
+
+void wait_for_completion_unordered(
+    Communicator& comm,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots,
+    BufferSet& buffers
+) {
+    std::unordered_map<std::size_t, std::unique_ptr<Communicator::Future>> future_map;
+    future_map.reserve(futures.size());
+    for (std::size_t i = 0; i < futures.size(); ++i) {
+        future_map.emplace(i, std::move(futures.at(i)));
+    }
+    futures.clear();
+
+    while (!future_map.empty()) {
+        auto const completed_keys = comm.test_some(future_map);
+        for (auto const key : completed_keys) {
+            auto iter = future_map.find(key);
+            RAPIDSMPF_EXPECTS(iter != future_map.end(), "completed future key missing");
+            auto completed = std::move(iter->second);
+            future_map.erase(iter);
+            release_completed_future(
+                comm, std::move(completed), future_slots.at(key), buffers
+            );
+        }
+    }
+    future_slots.clear();
+}
+
+void wait_for_completion(
+    Communicator& comm,
+    ArgumentParser const& args,
+    std::vector<std::unique_ptr<Communicator::Future>>& futures,
+    std::vector<FutureSlot>& future_slots,
+    BufferSet& buffers
+) {
+    switch (args.completion_mode) {
+    case CompletionMode::Ordered:
+        wait_for_completion_ordered(comm, futures, future_slots, buffers);
+        break;
+    case CompletionMode::Unordered:
+        wait_for_completion_unordered(comm, futures, future_slots, buffers);
+        break;
+    }
+}
+
+Duration run(
+    std::shared_ptr<Communicator> comm,
+    ArgumentParser const& args,
+    BufferSet& buffers,
+    std::shared_ptr<rapidsmpf::Statistics> statistics
+) {
     // Sync before we start the timer.
     RAPIDSMPF_CUDA_TRY(cudaDeviceSynchronize());
+    barrier(comm);
 
     auto const t0_elapsed = Clock::now();
 
-    Tag const tag{0, 0};
     std::vector<std::unique_ptr<Communicator::Future>> futures;
-    for (std::uint64_t i = 0; i < args.num_ops; ++i) {
-        for (Rank rank = 0; rank < static_cast<Rank>(comm->nranks()); ++rank) {
-            auto buf = std::move(recv_bufs.at(
-                static_cast<std::uint64_t>(rank)
-                + i * static_cast<std::uint64_t>(comm->nranks())
-            ));
-            if (rank != comm->rank()) {
-                statistics->add_bytes_stat("all-to-all-recv", buf->size);
-                futures.push_back(comm->recv(rank, tag, std::move(buf)));
-            }
-        }
-        for (Rank rank = 0; rank < static_cast<Rank>(comm->nranks()); ++rank) {
-            auto buf = std::move(send_bufs.at(
-                static_cast<std::uint64_t>(rank)
-                + i * static_cast<std::uint64_t>(comm->nranks())
-            ));
-            if (rank != comm->rank()) {
-                statistics->add_bytes_stat("all-to-all-send", buf->size);
-                futures.push_back(comm->send(std::move(buf), rank, tag));
-            }
-        }
-    }
-
-    while (!futures.empty()) {
-        std::ignore = comm->test_some(futures);
-    }
+    std::vector<FutureSlot> future_slots;
+    futures.reserve(args.num_ops * static_cast<std::uint64_t>(comm->nranks() - 1) * 2);
+    future_slots.reserve(futures.capacity());
+    post_all_copies(*comm, args, *statistics, buffers, futures, future_slots);
+    wait_for_completion(*comm, args, futures, future_slots, buffers);
 
     return Clock::now() - t0_elapsed;
 }
@@ -347,6 +1130,8 @@ int main(int argc, char** argv) {
         log->print(ss.str());
     }
 
+    auto buffers = allocate_buffers(comm, args, stream, br.get());
+
 #ifdef RAPIDSMPF_HAVE_CUPTI
     // Create CUPTI monitor if enabled
     std::unique_ptr<rapidsmpf::CuptiMonitor> cupti_monitor;
@@ -359,23 +1144,20 @@ int main(int argc, char** argv) {
 
     auto const local_messages_send =
         args.msg_size * args.num_ops * (static_cast<std::uint64_t>(comm->nranks()) - 1);
-    auto const local_messages =
-        args.msg_size * args.num_ops * static_cast<std::uint64_t>(comm->nranks());
+    auto const global_messages =
+        local_messages_send * static_cast<std::uint64_t>(comm->nranks());
     std::vector<double> elapsed_vec;
     for (std::uint64_t i = 0; i < args.num_warmups + args.num_runs; ++i) {
         // Enable statistics for the last run.
         if (i == args.num_warmups + args.num_runs - 1) {
             stats->enable();
         }
-        auto const elapsed = run(comm, args, stream, br.get(), stats).count();
+        auto const elapsed = run(comm, args, buffers, stats).count();
+        barrier(comm);
         std::stringstream ss;
         ss << "elapsed: " << format_duration(elapsed)
            << " | local comm: " << format_nbytes(local_messages_send / elapsed)
-           << "/s | local throughput: " << format_nbytes(local_messages / elapsed)
-           << "/s | global throughput: "
-           << format_nbytes(
-                  local_messages * static_cast<std::uint64_t>(comm->nranks()) / elapsed
-              )
+           << "/s | global throughput: " << format_nbytes(global_messages / elapsed)
            << "/s";
         if (i < args.num_warmups) {
             ss << " (warmup run)";
@@ -391,12 +1173,7 @@ int main(int argc, char** argv) {
         std::stringstream ss;
         ss << "means: " << format_duration(elapsed_mean)
            << " | local comm: " << format_nbytes(local_messages_send / elapsed_mean)
-           << "/s | local throughput: " << format_nbytes(local_messages / elapsed_mean)
-           << "/s | global throughput: "
-           << format_nbytes(
-                  local_messages * static_cast<std::uint64_t>(comm->nranks())
-                  / elapsed_mean
-              )
+           << "/s | global throughput: " << format_nbytes(global_messages / elapsed_mean)
            << "/s | num_ops: " << args.num_ops << " | nranks: " << comm->nranks();
         log->print(ss.str());
     }

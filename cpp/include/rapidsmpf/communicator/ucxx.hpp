@@ -316,6 +316,14 @@ class UCXX final : public Communicator {
     void barrier();
 
     /**
+     * @brief Progress outstanding UCXX communication work.
+     *
+     * This method is primarily intended for benchmarks and diagnostics that need
+     * explicit control over when application-thread UCXX progress is made.
+     */
+    void progress();
+
+    /**
      * @brief Get address to which listener is bound.
      *
      * @return The address to which listener is bound.

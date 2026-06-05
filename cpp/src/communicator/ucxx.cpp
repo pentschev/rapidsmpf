@@ -1415,6 +1415,10 @@ void UCXX::barrier() {
     log->trace("Barrier completed on rank ", shared_resources_->rank());
 }
 
+void UCXX::progress() {
+    shared_resources_->progress_worker();
+}
+
 std::unique_ptr<Buffer> UCXX::wait(std::unique_ptr<Communicator::Future> future) {
     auto ucxx_future = dynamic_cast<Future*>(future.get());
     RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");

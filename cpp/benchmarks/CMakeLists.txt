@@ -59,6 +59,127 @@ install(
   EXCLUDE_FROM_ALL
 )
 
+add_executable(bench_cuda_ipc "bench_cuda_ipc.cu")
+set_target_properties(
+  bench_cuda_ipc
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RAPIDSMPF_BINARY_DIR}/benchmarks"
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CXX_EXTENSIONS ON
+             CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON
+)
+target_compile_options(
+  bench_cuda_ipc PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>"
+                         "$<$<COMPILE_LANGUAGE:CUDA>:${RAPIDSMPF_CUDA_FLAGS}>"
+)
+target_link_libraries(
+  bench_cuda_ipc
+  PRIVATE rapidsmpf::rapidsmpf
+          CUDA::cudart
+          CUDA::cuda_driver
+          $<TARGET_NAME_IF_EXISTS:MPI::MPI_CXX>
+          $<TARGET_NAME_IF_EXISTS:conda_env>
+          maybe_asan
+)
+install(
+  TARGETS bench_cuda_ipc
+  COMPONENT benchmarking
+  DESTINATION bin/benchmarks/librapidsmpf
+  EXCLUDE_FROM_ALL
+)
+
+add_executable(bench_ucp_tag "bench_ucp_tag.cu")
+set_target_properties(
+  bench_ucp_tag
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RAPIDSMPF_BINARY_DIR}/benchmarks"
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CXX_EXTENSIONS ON
+             CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON
+)
+target_compile_options(
+  bench_ucp_tag PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>"
+                        "$<$<COMPILE_LANGUAGE:CUDA>:${RAPIDSMPF_CUDA_FLAGS}>"
+)
+target_link_libraries(
+  bench_ucp_tag
+  PRIVATE rapidsmpf::rapidsmpf
+          ucxx::ucxx
+          $<TARGET_NAME_IF_EXISTS:ucx::ucp>
+          $<TARGET_NAME_IF_EXISTS:ucx::ucs>
+          CUDA::cudart
+          CUDA::cuda_driver
+          $<TARGET_NAME_IF_EXISTS:MPI::MPI_CXX>
+          $<TARGET_NAME_IF_EXISTS:conda_env>
+          maybe_asan
+)
+install(
+  TARGETS bench_ucp_tag
+  COMPONENT benchmarking
+  DESTINATION bin/benchmarks/librapidsmpf
+  EXCLUDE_FROM_ALL
+)
+
+add_executable(bench_ucp_rma "bench_ucp_rma.cu")
+set_target_properties(
+  bench_ucp_rma
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RAPIDSMPF_BINARY_DIR}/benchmarks"
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CXX_EXTENSIONS ON
+             CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON
+)
+target_compile_options(
+  bench_ucp_rma PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>"
+                        "$<$<COMPILE_LANGUAGE:CUDA>:${RAPIDSMPF_CUDA_FLAGS}>"
+)
+target_link_libraries(
+  bench_ucp_rma
+  PRIVATE rapidsmpf::rapidsmpf
+          ucxx::ucxx
+          $<TARGET_NAME_IF_EXISTS:ucx::ucp>
+          $<TARGET_NAME_IF_EXISTS:ucx::ucs>
+          CUDA::cudart
+          CUDA::cuda_driver
+          $<TARGET_NAME_IF_EXISTS:MPI::MPI_CXX>
+          $<TARGET_NAME_IF_EXISTS:conda_env>
+          maybe_asan
+)
+install(
+  TARGETS bench_ucp_rma
+  COMPONENT benchmarking
+  DESTINATION bin/benchmarks/librapidsmpf
+  EXCLUDE_FROM_ALL
+)
+
+add_executable(bench_cuda_p2p "bench_cuda_p2p.cu")
+set_target_properties(
+  bench_cuda_p2p
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${RAPIDSMPF_BINARY_DIR}/benchmarks"
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CXX_EXTENSIONS ON
+             CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON
+)
+target_compile_options(
+  bench_cuda_p2p PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${RAPIDSMPF_CXX_FLAGS}>"
+                         "$<$<COMPILE_LANGUAGE:CUDA>:${RAPIDSMPF_CUDA_FLAGS}>"
+)
+target_link_libraries(
+  bench_cuda_p2p
+  PRIVATE CUDA::cudart CUDA::cuda_driver $<TARGET_NAME_IF_EXISTS:conda_env> maybe_asan
+)
+install(
+  TARGETS bench_cuda_p2p
+  COMPONENT benchmarking
+  DESTINATION bin/benchmarks/librapidsmpf
+  EXCLUDE_FROM_ALL
+)
+
 # Find or install GoogleBench
 include(${rapids-cmake-dir}/cpm/gbench.cmake)
 rapids_cpm_gbench(BUILD_STATIC)

@@ -36,6 +36,7 @@ inline const std::unordered_map<std::string, std::string> DEFAULTS{
     {"memory_reserve_timeout", "100ms"},
     {"allow_overbooking_by_default", "true"},
     {"log", "WARN"},
+    {"detailed_statistics", "false"},
     {"ucxx_progress_mode", "thread-blocking"},
     {"ucxx_request_attributes", "false"},
 };

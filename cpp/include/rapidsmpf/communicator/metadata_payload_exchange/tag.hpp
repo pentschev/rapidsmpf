@@ -96,11 +96,18 @@ class TagMetadataPayloadExchange : public MetadataPayloadExchange {
         std::unique_ptr<Message> message;
         std::uint64_t message_id{0};
         std::size_t expected_payload_size{0};
+        MemoryType source_memory_type{MemoryType::HOST};
 
         TagMessage(
-            std::unique_ptr<Message> msg, std::uint64_t id = 0, std::size_t size = 0
+            std::unique_ptr<Message> msg,
+            std::uint64_t id = 0,
+            std::size_t size = 0,
+            MemoryType source_memory_type = MemoryType::HOST
         )
-            : message(std::move(msg)), message_id(id), expected_payload_size(size) {}
+            : message(std::move(msg)),
+              message_id(id),
+              expected_payload_size(size),
+              source_memory_type(source_memory_type) {}
     };
 
     // Core communication infrastructure

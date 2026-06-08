@@ -127,6 +127,17 @@ class Statistics : public std::enable_shared_from_this<Statistics> {
     static std::shared_ptr<Statistics> create(Mode mode = Mode::Enabled);
 
     /**
+     * @brief Creates a Statistics instance.
+     *
+     * @param mode Selects whether tracking starts enabled or disabled. See
+     * `Mode`. Disabled instances can be toggled on later via `enable()`.
+     * @param detailed Selects whether optional detailed statistics should be
+     * collected by components that support them.
+     * @return A shared pointer to a newly constructed Statistics instance.
+     */
+    static std::shared_ptr<Statistics> create(Mode mode, bool detailed);
+
+    /**
      * @brief Returns a disabled Statistics instance which can be enabled later.
      *
      * @return A Statistics instance with tracking disabled.
@@ -163,6 +174,18 @@ class Statistics : public std::enable_shared_from_this<Statistics> {
     }
 
     /**
+     * @brief Checks if optional detailed statistics collection is enabled.
+     *
+     * Components should still check `enabled()` before recording statistics. This
+     * flag controls additional high-cardinality or higher-overhead metrics.
+     *
+     * @return True if detailed statistics are requested, otherwise false.
+     */
+    bool detailed_enabled() const noexcept {
+        return detailed_enabled_.load(std::memory_order_acquire);
+    }
+
+    /**
      * @brief Enable statistics tracking for this instance.
      */
     void enable() noexcept {
@@ -174,6 +197,20 @@ class Statistics : public std::enable_shared_from_this<Statistics> {
      */
     void disable() noexcept {
         enabled_.store(false, std::memory_order_release);
+    }
+
+    /**
+     * @brief Enable optional detailed statistics collection.
+     */
+    void enable_detailed() noexcept {
+        detailed_enabled_.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief Disable optional detailed statistics collection.
+     */
+    void disable_detailed() noexcept {
+        detailed_enabled_.store(false, std::memory_order_release);
     }
 
     /**
@@ -627,10 +664,11 @@ class Statistics : public std::enable_shared_from_this<Statistics> {
         Formatter formatter;
     };
 
-    explicit Statistics(bool enabled);
+    explicit Statistics(bool enabled, bool detailed_enabled = false);
 
     mutable std::mutex mutex_;
     std::atomic<bool> enabled_;
+    std::atomic<bool> detailed_enabled_;
     std::map<std::string, Stat> stats_;
     std::map<std::string, ReportEntry> report_entries_;
     std::unordered_map<std::string, MemoryRecord> memory_records_;

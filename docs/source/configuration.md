@@ -45,6 +45,15 @@ rapidsmpf::config::Options options{rapidsmpf::config::get_environment_variables(
   - **Default**: `False`
   - **Description**: Enable RapidsMPF statistics collection.
 
+- **`detailed_statistics`**
+  - **Environment Variable**: `RAPIDSMPF_DETAILED_STATISTICS`
+  - **Default**: `False`
+  - **Description**: Enable optional detailed statistics that may add overhead or
+    increase metric cardinality. Currently this enables metadata-payload transfer
+    byte counts broken down by sender and receiver memory category, such as
+    `metadata-payload-transfer-device-to-host`. Metrics are emitted only when
+    `statistics` is also enabled.
+
 - **`ucxx_request_attributes`**
   - **Environment Variable**: `RAPIDSMPF_UCXX_REQUEST_ATTRIBUTES`
   - **Default**: `false`

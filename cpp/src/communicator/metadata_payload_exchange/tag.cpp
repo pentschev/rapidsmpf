@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
@@ -16,6 +18,46 @@
 #include <rapidsmpf/utils/misc.hpp>
 
 namespace rapidsmpf::communicator {
+
+namespace {
+
+std::uint8_t encode_memory_type(MemoryType memory_type) {
+    return static_cast<std::uint8_t>(memory_type);
+}
+
+MemoryType decode_memory_type(std::uint8_t value) {
+    switch (static_cast<MemoryType>(value)) {
+    case MemoryType::DEVICE:
+    case MemoryType::PINNED_HOST:
+    case MemoryType::HOST:
+        return static_cast<MemoryType>(value);
+    }
+    RAPIDSMPF_FAIL("Invalid memory type in metadata-payload protocol");
+}
+
+std::string_view transfer_memory_type_name(MemoryType memory_type) {
+    switch (memory_type) {
+    case MemoryType::DEVICE:
+        return "device";
+    case MemoryType::PINNED_HOST:
+    case MemoryType::HOST:
+        return "host";
+    }
+    RAPIDSMPF_FAIL("Invalid memory type for metadata-payload transfer statistics");
+}
+
+std::string transfer_stat_name(MemoryType source, MemoryType destination) {
+    std::string ret{"metadata-payload-transfer-"};
+    ret += transfer_memory_type_name(source);
+    ret += "-to-";
+    ret += transfer_memory_type_name(destination);
+    return ret;
+}
+
+constexpr std::size_t metadata_protocol_overhead =
+    sizeof(std::uint64_t) + sizeof(std::size_t) + sizeof(std::uint8_t);
+
+}  // namespace
 
 TagMetadataPayloadExchange::TagMetadataPayloadExchange(
     std::shared_ptr<Communicator> comm,
@@ -66,17 +108,17 @@ void TagMetadataPayloadExchange::send(
 
         std::size_t payload_size =
             (message->data() != nullptr) ? message->data()->size : 0;
+        MemoryType const source_memory_type =
+            (message->data() != nullptr) ? message->data()->mem_type() : MemoryType::HOST;
 
-        // Append metadata: [original_metadata][message_id][payload_size]
+        // Append metadata:
+        // [original_metadata][message_id][payload_size][source_memory_type].
         // Release the original metadata and append protocol fields to avoid copying
         auto combined_metadata =
             std::make_unique<std::vector<std::uint8_t>>(message->release_metadata());
 
-        // Reserve space for message_id and payload_size at the end
         std::size_t original_size = combined_metadata->size();
-        combined_metadata->resize(
-            original_size + sizeof(std::uint64_t) + sizeof(std::size_t)
-        );
+        combined_metadata->resize(original_size + metadata_protocol_overhead);
 
         // Append message_id
         std::memcpy(
@@ -88,6 +130,13 @@ void TagMetadataPayloadExchange::send(
             combined_metadata->data() + original_size + sizeof(std::uint64_t),
             &payload_size,
             sizeof(std::size_t)
+        );
+        auto const encoded_memory_type = encode_memory_type(source_memory_type);
+        std::memcpy(
+            combined_metadata->data() + original_size + sizeof(std::uint64_t)
+                + sizeof(std::size_t),
+            &encoded_memory_type,
+            sizeof(encoded_memory_type)
         );
 
         fire_and_forget_.push_back(
@@ -140,17 +189,23 @@ void TagMetadataPayloadExchange::finish() {
     // exactly how many application messages we sent to it, so the peer can
     // stop receiving once it has them all.
     // Format: [sentinel=UINT64_MAX (8 bytes)][message_count (8 bytes)]
+    //         [source_memory_type (1 byte)]
     for (Rank peer = 0; peer < nranks_; ++peer) {
         if (peer == rank_) {
             continue;
         }
-        auto termination = std::make_unique<std::vector<std::uint8_t>>(
-            sizeof(std::uint64_t) + sizeof(std::size_t)
-        );
+        auto termination =
+            std::make_unique<std::vector<std::uint8_t>>(metadata_protocol_overhead);
         std::memcpy(termination->data(), &termination_sentinel_, sizeof(std::uint64_t));
         auto count = messages_sent_to_[safe_cast<std::size_t>(peer)];
         std::memcpy(
             termination->data() + sizeof(std::uint64_t), &count, sizeof(std::size_t)
+        );
+        auto const encoded_memory_type = encode_memory_type(MemoryType::HOST);
+        std::memcpy(
+            termination->data() + sizeof(std::uint64_t) + sizeof(std::size_t),
+            &encoded_memory_type,
+            sizeof(encoded_memory_type)
         );
         fire_and_forget_.push_back(
             comm_->send(std::move(termination), peer, metadata_tag_)
@@ -201,15 +256,13 @@ void TagMetadataPayloadExchange::receive_metadata() {
                 break;
             }
 
+            // Extract message_id and payload_size from the protocol trailer.
             RAPIDSMPF_EXPECTS(
-                msg->size() >= sizeof(std::uint64_t) + sizeof(std::size_t),
-                "Truncated metadata"
+                msg->size() >= metadata_protocol_overhead, "Truncated metadata"
             );
 
-            // Extract message_id and payload_size from the protocol trailer.
-            std::size_t const protocol_overhead =
-                sizeof(std::uint64_t) + sizeof(std::size_t);
-            std::size_t const original_metadata_size = msg->size() - protocol_overhead;
+            std::size_t const original_metadata_size =
+                msg->size() - metadata_protocol_overhead;
 
             std::uint64_t message_id;
             std::memcpy(
@@ -222,6 +275,15 @@ void TagMetadataPayloadExchange::receive_metadata() {
                 msg->data() + original_metadata_size + sizeof(std::uint64_t),
                 sizeof(std::size_t)
             );
+
+            std::uint8_t encoded_memory_type{};
+            std::memcpy(
+                &encoded_memory_type,
+                msg->data() + original_metadata_size + sizeof(std::uint64_t)
+                    + sizeof(std::size_t),
+                sizeof(encoded_memory_type)
+            );
+            MemoryType const source_memory_type = decode_memory_type(encoded_memory_type);
 
             // Check for termination marker.
             if (message_id == termination_sentinel_) {
@@ -256,7 +318,7 @@ void TagMetadataPayloadExchange::receive_metadata() {
 
             log->trace("recv_from ", peer, " (message_id=", message_id, ")");
             incoming_messages_[peer].emplace_back(
-                std::move(message), message_id, payload_size
+                std::move(message), message_id, payload_size, source_memory_type
             );
         }
     }
@@ -382,6 +444,14 @@ TagMetadataPayloadExchange::complete_data_transfers() {
 
                     auto future = std::move(future_it->second);
                     auto received_buffer = comm_->release_data(std::move(future));
+                    if (statistics_->enabled() && statistics_->detailed_enabled()) {
+                        statistics_->add_bytes_stat(
+                            transfer_stat_name(
+                                tag_msg.source_memory_type, received_buffer->mem_type()
+                            ),
+                            tag_msg.expected_payload_size
+                        );
+                    }
 
                     tag_msg.message->set_data(std::move(received_buffer));
                     completed_messages.push_back(std::move(tag_msg.message));

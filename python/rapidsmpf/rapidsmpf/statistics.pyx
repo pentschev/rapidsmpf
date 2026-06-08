@@ -41,10 +41,13 @@ cdef extern from *:
     // Cython-friendly wrappers around `Statistics::create(Mode)`. Cython has
     // limited support for nested C++ enums, so we keep a Python-facing
     // `bool` signature and translate to the `Mode` enum here.
-    inline std::shared_ptr<rapidsmpf::Statistics> cpp_create(bool enabled) {
+    inline std::shared_ptr<rapidsmpf::Statistics> cpp_create(
+        bool enabled, bool detailed
+    ) {
         return rapidsmpf::Statistics::create(
             enabled ? rapidsmpf::Statistics::Mode::Enabled
-                    : rapidsmpf::Statistics::Mode::Disabled
+                    : rapidsmpf::Statistics::Mode::Disabled,
+            detailed
         );
     }
     inline std::shared_ptr<rapidsmpf::Statistics> cpp_disabled() {
@@ -120,7 +123,9 @@ cdef extern from *:
         );
     }
     """
-    shared_ptr[cpp_Statistics] cpp_create(bool_t enabled) except +ex_handler nogil
+    shared_ptr[cpp_Statistics] cpp_create(
+        bool_t enabled, bool_t detailed
+    ) except +ex_handler nogil
     shared_ptr[cpp_Statistics] cpp_disabled() except +ex_handler nogil
     string cpp_report(
         cpp_Statistics stats,
@@ -159,10 +164,12 @@ cdef class Statistics:
     ----------
     enable
         Whether statistics tracking is enabled.
+    detailed
+        Whether optional detailed statistics collection is enabled.
     """
-    def __init__(self, *, bool_t enable):
+    def __init__(self, *, bool_t enable, bool_t detailed=False):
         with nogil:
-            self._handle = cpp_create(enable)
+            self._handle = cpp_create(enable, detailed)
 
     @classmethod
     def from_options(cls, Options options not None):
@@ -216,6 +223,17 @@ cdef class Statistics:
         True if statistics is enabled, otherwise False.
         """
         return deref(self._handle).enabled()
+
+    @property
+    def detailed_enabled(self):
+        """
+        Checks if optional detailed statistics collection is enabled.
+
+        Returns
+        -------
+        True if detailed statistics are requested, otherwise False.
+        """
+        return deref(self._handle).detailed_enabled()
 
     def report(
         self,

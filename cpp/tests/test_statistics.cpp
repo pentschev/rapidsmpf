@@ -39,6 +39,7 @@ class StatisticsTest : public ::testing::Test {
 TEST_F(StatisticsTest, Disabled) {
     auto stats = rapidsmpf::Statistics::disabled();
     EXPECT_FALSE(stats->enabled());
+    EXPECT_FALSE(stats->detailed_enabled());
 
     // Disabled statistics is a no-op.
     stats->add_bytes_stat("name", 1);
@@ -48,6 +49,19 @@ TEST_F(StatisticsTest, Disabled) {
     // `Mode::Disabled` instances can be toggled on independently.
     stats->enable();
     EXPECT_TRUE(stats->enabled());
+}
+
+TEST_F(StatisticsTest, DetailedFlag) {
+    using Mode = rapidsmpf::Statistics::Mode;
+    auto stats = rapidsmpf::Statistics::create(Mode::Enabled, true);
+    EXPECT_TRUE(stats->enabled());
+    EXPECT_TRUE(stats->detailed_enabled());
+
+    stats->disable_detailed();
+    EXPECT_FALSE(stats->detailed_enabled());
+
+    stats->enable_detailed();
+    EXPECT_TRUE(stats->detailed_enabled());
 }
 
 TEST_F(StatisticsTest, Communication) {
@@ -521,6 +535,17 @@ TEST_F(StatisticsTest, SerializeRoundTripPreservesEnabledFlag) {
     auto const bytes2 = enabled->serialize();
     auto deserialized2 = rapidsmpf::Statistics::deserialize(bytes2);
     EXPECT_TRUE(deserialized2->enabled());
+}
+
+TEST_F(StatisticsTest, SerializeRoundTripPreservesDetailedFlag) {
+    using Mode = rapidsmpf::Statistics::Mode;
+    auto detailed = rapidsmpf::Statistics::create(Mode::Enabled, true);
+
+    auto const bytes = detailed->serialize();
+    auto deserialized = rapidsmpf::Statistics::deserialize(bytes);
+
+    EXPECT_TRUE(deserialized->enabled());
+    EXPECT_TRUE(deserialized->detailed_enabled());
 }
 
 TEST_F(StatisticsTest, SerializeRoundTripWithReportEntries) {

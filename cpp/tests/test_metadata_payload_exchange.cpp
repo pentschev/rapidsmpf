@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cstring>
+#include <numeric>
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -29,15 +32,7 @@ class MetadataPayloadExchangeTest : public ::testing::Test {
         mr = std::make_unique<rmm::mr::cuda_memory_resource>();
         br = BufferResource::create(*mr);
         stream = rmm::cuda_stream_default;
-        statistics = Statistics::create();
-
-        auto allocate_fn = [this](std::size_t size) {
-            return allocate_receive_buffer(size);
-        };
-
-        comm_interface = std::make_unique<TagMetadataPayloadExchange>(
-            GlobalEnvironment->comm_, OpID{42}, allocate_fn, statistics
-        );
+        reset_exchange(OpID{42});
 
         GlobalEnvironment->barrier();
     }
@@ -47,21 +42,27 @@ class MetadataPayloadExchangeTest : public ::testing::Test {
     }
 
     std::unique_ptr<MetadataPayloadExchange::Message> create_test_message(
-        Rank peer_rank, std::vector<std::uint8_t> metadata, std::size_t data_size = 0
+        Rank peer_rank,
+        std::vector<std::uint8_t> metadata,
+        std::size_t data_size = 0,
+        MemoryType memory_type = MemoryType::DEVICE
     ) {
         std::unique_ptr<Buffer> data_buffer = nullptr;
         if (data_size > 0) {
-            data_buffer = br->make_buffer(
-                stream, br->reserve_or_fail(data_size, MemoryType::DEVICE)
-            );
+            data_buffer =
+                br->make_buffer(stream, br->reserve_or_fail(data_size, memory_type));
             // Fill with test data
             data_buffer->write_access(
-                [data_size](std::byte* ptr, rmm::cuda_stream_view stream) {
+                [data_size, memory_type](std::byte* ptr, rmm::cuda_stream_view stream) {
                     std::vector<std::uint8_t> test_data(data_size);
                     std::iota(test_data.begin(), test_data.end(), 0);
-                    RAPIDSMPF_CUDA_TRY(
-                        cuda_memcpy_async(ptr, test_data.data(), data_size, stream)
-                    );
+                    if (memory_type == MemoryType::DEVICE) {
+                        RAPIDSMPF_CUDA_TRY(
+                            cuda_memcpy_async(ptr, test_data.data(), data_size, stream)
+                        );
+                    } else {
+                        std::memcpy(ptr, test_data.data(), data_size);
+                    }
                 }
             );
             data_buffer->stream().synchronize();
@@ -73,7 +74,24 @@ class MetadataPayloadExchangeTest : public ::testing::Test {
     }
 
     std::unique_ptr<Buffer> allocate_receive_buffer(std::size_t size) {
-        return br->make_buffer(stream, br->reserve_or_fail(size, MemoryType::DEVICE));
+        return br->make_buffer(stream, br->reserve_or_fail(size, receive_memory_type));
+    }
+
+    void reset_exchange(
+        OpID op_id,
+        bool detailed_statistics = false,
+        MemoryType receive_memory_type = MemoryType::DEVICE
+    ) {
+        this->receive_memory_type = receive_memory_type;
+        statistics = Statistics::create(Statistics::Mode::Enabled, detailed_statistics);
+
+        auto allocate_fn = [this](std::size_t size) {
+            return allocate_receive_buffer(size);
+        };
+
+        comm_interface = std::make_unique<TagMetadataPayloadExchange>(
+            GlobalEnvironment->comm_, op_id, allocate_fn, statistics
+        );
     }
 
     void wait_for_communication_complete() {
@@ -88,10 +106,14 @@ class MetadataPayloadExchangeTest : public ::testing::Test {
         EXPECT_EQ(buffer->size, expected_size);
 
         std::vector<std::uint8_t> received_data(expected_size);
-        RAPIDSMPF_CUDA_TRY(
-            cuda_memcpy_async(received_data.data(), buffer->data(), expected_size, stream)
-        );
-        stream.synchronize();
+        if (buffer->mem_type() == MemoryType::DEVICE) {
+            RAPIDSMPF_CUDA_TRY(cuda_memcpy_async(
+                received_data.data(), buffer->data(), expected_size, stream
+            ));
+            stream.synchronize();
+        } else {
+            std::memcpy(received_data.data(), buffer->data(), expected_size);
+        }
 
         for (std::size_t i = 0; i < expected_size; ++i) {
             EXPECT_EQ(received_data[i], static_cast<std::uint8_t>(i % 256));
@@ -104,6 +126,7 @@ class MetadataPayloadExchangeTest : public ::testing::Test {
     std::shared_ptr<BufferResource> br;
     std::shared_ptr<Statistics> statistics;
     std::unique_ptr<TagMetadataPayloadExchange> comm_interface;
+    MemoryType receive_memory_type{MemoryType::DEVICE};
 };
 
 TEST_F(MetadataPayloadExchangeTest, InitialState) {
@@ -336,6 +359,78 @@ TEST_F(MetadataPayloadExchangeTest, SendReceiveWithData) {
     verify_data_content(msg->data(), data_size);
 
     wait_for_communication_complete();
+}
+
+TEST_F(MetadataPayloadExchangeTest, TransferStatisticsDisabledByDefault) {
+    if (comm->nranks() < 2) {
+        GTEST_SKIP() << "Test requires at least 2 ranks";
+    }
+
+    reset_exchange(OpID{43}, false, MemoryType::HOST);
+
+    Rank next_rank = (comm->rank() + 1) % comm->nranks();
+    std::vector<std::uint8_t> test_metadata = {0x11, 0x22};
+    constexpr std::size_t data_size = 768;
+
+    comm_interface->send(
+        create_test_message(next_rank, test_metadata, data_size, MemoryType::HOST)
+    );
+
+    std::vector<std::unique_ptr<MetadataPayloadExchange::Message>> received_messages;
+    while (received_messages.empty()) {
+        comm_interface->progress();
+        auto messages = comm_interface->recv();
+        std::ranges::move(messages, std::back_inserter(received_messages));
+
+        if (received_messages.empty()) {
+            std::this_thread::yield();
+        }
+    }
+
+    wait_for_communication_complete();
+
+    EXPECT_THROW(
+        std::ignore = statistics->get_stat("metadata-payload-transfer-host-to-host"),
+        std::out_of_range
+    );
+}
+
+TEST_F(MetadataPayloadExchangeTest, DetailedTransferStatisticsRecordMemoryTypes) {
+    if (comm->nranks() < 2) {
+        GTEST_SKIP() << "Test requires at least 2 ranks";
+    }
+
+    reset_exchange(OpID{44}, true, MemoryType::HOST);
+
+    Rank next_rank = (comm->rank() + 1) % comm->nranks();
+    Rank prev_rank = (comm->rank() - 1 + comm->nranks()) % comm->nranks();
+    std::vector<std::uint8_t> test_metadata = {0x33, 0x44};
+    constexpr std::size_t data_size = 1024;
+
+    comm_interface->send(
+        create_test_message(next_rank, test_metadata, data_size, MemoryType::HOST)
+    );
+
+    std::vector<std::unique_ptr<MetadataPayloadExchange::Message>> received_messages;
+    while (received_messages.empty()) {
+        comm_interface->progress();
+        auto messages = comm_interface->recv();
+        std::ranges::move(messages, std::back_inserter(received_messages));
+
+        if (received_messages.empty()) {
+            std::this_thread::yield();
+        }
+    }
+
+    ASSERT_EQ(received_messages.size(), 1);
+    EXPECT_EQ(received_messages.front()->peer_rank(), prev_rank);
+    verify_data_content(received_messages.front()->data(), data_size);
+
+    wait_for_communication_complete();
+
+    auto const stat = statistics->get_stat("metadata-payload-transfer-host-to-host");
+    EXPECT_EQ(stat.count(), 1);
+    EXPECT_EQ(stat.value(), data_size);
 }
 
 TEST_F(MetadataPayloadExchangeTest, MultipleMessages) {

@@ -478,6 +478,26 @@ TEST(OptionsTest, StatisticsFromOptionsDisabledByDefault) {
     EXPECT_FALSE(stats->enabled());
 }
 
+TEST(OptionsTest, DetailedStatisticsDisabledByDefault) {
+    Options opts;  // Empty options
+
+    EXPECT_FALSE(opts.get<bool>("detailed_statistics", parse_string<bool>));
+    auto stats = Statistics::from_options(opts);
+    EXPECT_FALSE(stats->detailed_enabled());
+}
+
+TEST(OptionsTest, DetailedStatisticsFromOptionsEnabledWhenSetToTrue) {
+    std::unordered_map<std::string, std::string> strings = {
+        {"statistics", "True"}, {"detailed_statistics", "True"}
+    };
+    Options opts(strings);
+
+    auto stats = Statistics::from_options(opts);
+
+    EXPECT_TRUE(stats->enabled());
+    EXPECT_TRUE(stats->detailed_enabled());
+}
+
 TEST(OptionsTest, UCXXRequestAttributesDisabledByDefault) {
     Options opts;  // Empty options
 

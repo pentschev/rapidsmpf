@@ -19,6 +19,13 @@ if TYPE_CHECKING:
 def test_disabled() -> None:
     stats = Statistics(enable=False)
     assert not stats.enabled
+    assert not stats.detailed_enabled
+
+
+def test_detailed_flag() -> None:
+    stats = Statistics(enable=True, detailed=True)
+    assert stats.enabled
+    assert stats.detailed_enabled
 
 
 def test_add_get_stat() -> None:

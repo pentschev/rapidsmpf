@@ -163,15 +163,21 @@ Statistics::~Statistics() noexcept {
     StreamOrderedTiming::cancel_inflight_timings(this);
 }
 
-Statistics::Statistics(bool enabled) : enabled_{enabled} {}
+Statistics::Statistics(bool enabled, bool detailed_enabled)
+    : enabled_{enabled}, detailed_enabled_{detailed_enabled} {}
 
 std::shared_ptr<Statistics> Statistics::create(Mode mode) {
-    return std::shared_ptr<Statistics>(new Statistics(mode == Mode::Enabled));
+    return create(mode, false);
+}
+
+std::shared_ptr<Statistics> Statistics::create(Mode mode, bool detailed) {
+    return std::shared_ptr<Statistics>(new Statistics(mode == Mode::Enabled, detailed));
 }
 
 std::shared_ptr<Statistics> Statistics::from_options(config::Options options) {
     bool const enabled = options.get<bool>("statistics", parse_string<bool>);
-    return create(enabled ? Mode::Enabled : Mode::Disabled);
+    bool const detailed = options.get<bool>("detailed_statistics", parse_string<bool>);
+    return create(enabled ? Mode::Enabled : Mode::Disabled, detailed);
 }
 
 Statistics::Stat Statistics::get_stat(std::string const& name) const {
@@ -485,7 +491,9 @@ void Statistics::write_json(std::filesystem::path const& filepath) const {
 
 std::shared_ptr<Statistics> Statistics::copy() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto ret = Statistics::create(enabled() ? Mode::Enabled : Mode::Disabled);
+    auto ret = Statistics::create(
+        enabled() ? Mode::Enabled : Mode::Disabled, detailed_enabled()
+    );
     ret->stats_ = stats_;
     ret->report_entries_ = report_entries_;
     return ret;
@@ -522,6 +530,7 @@ std::vector<std::uint8_t> Statistics::serialize() const {
     //                               [formatter: uint8]
     //                               [num_stat_names: uint64]
     //                               Per stat_name: [len: uint64] [bytes]
+    //   [detailed_enabled: uint8]
     std::size_t total = sizeof(std::uint8_t);  // enabled flag
     total += sizeof(std::uint64_t);
     for (auto const& [name, stat] : stats_) {
@@ -536,6 +545,7 @@ std::vector<std::uint8_t> Statistics::serialize() const {
             total += sizeof(std::uint64_t) + sn.size();
         }
     }
+    total += sizeof(std::uint8_t);
 
     std::vector<std::uint8_t> buf(total);
     std::uint8_t* ptr = buf.data();
@@ -562,6 +572,9 @@ std::vector<std::uint8_t> Statistics::serialize() const {
             ptr += sn.size();
         }
     }
+    write_pod(
+        ptr, static_cast<std::uint8_t>(detailed_enabled_.load(std::memory_order_acquire))
+    );
     return buf;
 }
 
@@ -622,6 +635,13 @@ std::shared_ptr<Statistics> Statistics::deserialize(std::span<std::uint8_t const
             ReportEntry{.stat_names = std::move(stat_names), .formatter = formatter}
         );
     }
+    if (!data.empty()) {
+        std::uint8_t detailed{};
+        data = read_pod(data, detailed);
+        if (detailed != 0) {
+            ret->enable_detailed();
+        }
+    }
     return ret;
 }
 
@@ -640,6 +660,7 @@ std::shared_ptr<Statistics> Statistics::merge(
         std::map<std::string, Stat> stats;
         std::map<std::string, ReportEntry> entries;
         bool enabled;
+        bool detailed_enabled;
     };
 
     std::vector<Snapshot> snapshots;
@@ -651,12 +672,17 @@ std::shared_ptr<Statistics> Statistics::merge(
             std::invalid_argument
         );
         std::lock_guard lock(s->mutex_);
-        snapshots.push_back({s->stats_, s->report_entries_, s->enabled()});
+        snapshots.push_back(
+            {s->stats_, s->report_entries_, s->enabled(), s->detailed_enabled()}
+        );
     }
 
     bool const any_enabled =
         std::ranges::any_of(snapshots, [](auto const& s) { return s.enabled; });
-    auto ret = Statistics::create(any_enabled ? Mode::Enabled : Mode::Disabled);
+    bool const any_detailed =
+        std::ranges::any_of(snapshots, [](auto const& s) { return s.detailed_enabled; });
+    auto ret =
+        Statistics::create(any_enabled ? Mode::Enabled : Mode::Disabled, any_detailed);
 
     for (auto const& snap : snapshots) {
         for (auto const& [name, stat] : snap.stats) {

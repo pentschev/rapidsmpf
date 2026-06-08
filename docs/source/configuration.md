@@ -45,6 +45,18 @@ rapidsmpf::config::Options options{rapidsmpf::config::get_environment_variables(
   - **Default**: `False`
   - **Description**: Enable RapidsMPF statistics collection.
 
+- **`ucxx_request_attributes`**
+  - **Environment Variable**: `RAPIDSMPF_UCXX_REQUEST_ATTRIBUTES`
+  - **Default**: `false`
+  - **Description**: Enable UCXX request-attribute querying for UCXX communicators.
+    This is required for detailed UCXX communication metrics such as local
+    send-source and recv-destination host/device byte counts and UCX debug-string
+    buckets. Querying request attributes may add non-negligible overhead, so it is
+    disabled by default. Metrics are emitted only when `statistics` is also enabled.
+    If you pass an external UCXX worker while this option is enabled, that worker
+    must already have been created with
+    `ucxx::experimental::WorkerBuilder::requestAttributes(true)`.
+
 - **`num_streaming_threads`**
   - **Environment Variable**: `RAPIDSMPF_NUM_STREAMING_THREADS`
   - **Default**: `1`

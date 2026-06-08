@@ -478,6 +478,21 @@ TEST(OptionsTest, StatisticsFromOptionsDisabledByDefault) {
     EXPECT_FALSE(stats->enabled());
 }
 
+TEST(OptionsTest, UCXXRequestAttributesDisabledByDefault) {
+    Options opts;  // Empty options
+
+    EXPECT_FALSE(opts.get<bool>("ucxx_request_attributes", parse_string<bool>));
+}
+
+TEST(OptionsTest, UCXXRequestAttributesEnabledWhenSetToTrue) {
+    std::unordered_map<std::string, std::string> strings = {
+        {"ucxx_request_attributes", "True"}
+    };
+    Options opts(strings);
+
+    EXPECT_TRUE(opts.get<bool>("ucxx_request_attributes", parse_string<bool>));
+}
+
 TEST(OptionsTest, PinnedMemoryResourceFromOptionsEnabledWhenSetToTrue) {
     std::unordered_map<std::string, std::string> strings = {{"pinned_memory", "True"}};
     Options opts(strings);

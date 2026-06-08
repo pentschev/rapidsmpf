@@ -16,6 +16,9 @@ This table gives an overview of the different statistics collected.
 | `recv-into-host-memory` | Data received directly into host memory rather than device memory, due to memory pressure at receive time. |
 | `shuffle-payload-recv` | Shuffle data received by this rank, including self-transfers. |
 | `shuffle-payload-send` | Shuffle data sent from this rank, including self-transfers. |
+| `ucxx-tag-send-source-{host\|device}` | UCXX tag-send bytes read from local host or device memory. Recorded only when `statistics=true` and `ucxx_request_attributes=true`. |
+| `ucxx-tag-recv-destination-{host\|device}` | UCXX tag-recv bytes written into local host or device memory. Recorded only when `statistics=true` and `ucxx_request_attributes=true`. |
+| `ucxx-tag-{send\|recv}-{source\|destination}-{host\|device}-debug-{debug}` | Detailed UCXX byte buckets broken down by sanitized UCX request debug string. If UCX completed inline or did not expose queryable request attributes for a completed request, `{debug}` is `no-queryable-request`. |
 
 Statistics are available in both C++ and [Python](#api-statistics).
 

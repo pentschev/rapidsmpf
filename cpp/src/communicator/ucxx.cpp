@@ -4,18 +4,27 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <utility>
 
+#include <ucxx/exception.h>
+#include <ucxx/experimental/worker_builder.h>
 #include <ucxx/request.h>
+#include <ucxx/worker.h>
 
 #include <rapidsmpf/communicator/ucxx.hpp>
 #include <rapidsmpf/config.hpp>
 #include <rapidsmpf/error.hpp>
+#include <rapidsmpf/statistics.hpp>
 #include <rapidsmpf/utils/misc.hpp>
+#include <rapidsmpf/utils/string.hpp>
 
 namespace rapidsmpf {
 
@@ -924,6 +933,90 @@ void create_cuda_context_callback(void* /* callbackArg */) {
     cudaFree(nullptr);
 }
 
+bool request_attributes_from_options(config::Options options) {
+    return options.get<bool>("ucxx_request_attributes", parse_string<bool>);
+}
+
+std::string_view request_operation_name(UCXX::Future::RequestOperation operation) {
+    switch (operation) {
+    case UCXX::Future::RequestOperation::TagSend:
+        return "ucxx-tag-send";
+    case UCXX::Future::RequestOperation::TagRecv:
+        return "ucxx-tag-recv";
+    }
+    return "ucxx-unknown";
+}
+
+std::string_view memory_role_name(UCXX::Future::MemoryRole memory_role) {
+    switch (memory_role) {
+    case UCXX::Future::MemoryRole::Source:
+        return "source";
+    case UCXX::Future::MemoryRole::Destination:
+        return "destination";
+    }
+    return "unknown";
+}
+
+std::string_view local_memory_type_name(MemoryType memory_type) {
+    switch (memory_type) {
+    case MemoryType::DEVICE:
+        return "device";
+    case MemoryType::PINNED_HOST:
+    case MemoryType::HOST:
+        return "host";
+    }
+    return "unknown";
+}
+
+std::string_view request_memory_type_name(
+    ucs_memory_type_t ucs_memory_type, std::optional<MemoryType> fallback_memory_type
+) {
+    switch (ucs_memory_type) {
+    case UCS_MEMORY_TYPE_HOST:
+        return "host";
+    case UCS_MEMORY_TYPE_CUDA:
+    case UCS_MEMORY_TYPE_CUDA_MANAGED:
+        return "device";
+    default:
+        if (fallback_memory_type.has_value()) {
+            return local_memory_type_name(*fallback_memory_type);
+        }
+        return "unknown";
+    }
+}
+
+std::string sanitize_stat_component(std::string_view input) {
+    std::string ret;
+    ret.reserve(input.size());
+    for (char c : input) {
+        auto const uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc)) {
+            ret.push_back(static_cast<char>(std::tolower(uc)));
+        } else if (c == '-' || c == '_' || c == '.' || c == '=' || c == ':' || c == ',') {
+            ret.push_back(c);
+        } else {
+            ret.push_back('_');
+        }
+    }
+    if (ret.empty()) {
+        return "empty";
+    }
+    return ret;
+}
+
+std::string request_stat_name(
+    UCXX::Future::RequestOperation operation,
+    UCXX::Future::MemoryRole memory_role,
+    std::string_view memory_type
+) {
+    std::string ret{request_operation_name(operation)};
+    ret += "-";
+    ret += memory_role_name(memory_role);
+    ret += "-";
+    ret += memory_type;
+    return ret;
+}
+
 }  // namespace
 
 InitializedRank::InitializedRank(
@@ -951,10 +1044,21 @@ std::unique_ptr<rapidsmpf::ucxx::InitializedRank> init(
                 RAPIDSMPF_FAIL("Invalid progress mode");
             }
         });
+    auto const request_attributes = request_attributes_from_options(options);
 
-    auto create_worker = [progress_mode]() {
+    RAPIDSMPF_EXPECTS(
+        !request_attributes || worker == nullptr || worker->isRequestAttributesEnabled(),
+        "ucxx_request_attributes=true requires an internally-created UCXX worker or an "
+        "external worker created with "
+        "ucxx::experimental::WorkerBuilder::requestAttributes(true)",
+        std::invalid_argument
+    );
+
+    auto create_worker = [progress_mode, request_attributes]() {
         auto context = ::ucxx::createContext({}, ::ucxx::Context::defaultFeatureFlags);
-        auto worker = context->createWorker(false);
+        auto worker = ::ucxx::experimental::createWorker(context)
+                          .requestAttributes(request_attributes)
+                          .build();
 
         RAPIDSMPF_EXPECTS(
             progress_mode != ProgressMode::Blocking,
@@ -1132,6 +1236,7 @@ UCXX::UCXX(
 )
     : shared_resources_(ucxx_initialized_rank->shared_resources_),
       options_{std::move(options)},
+      request_attributes_{request_attributes_from_options(options_)},
       logger_{std::make_shared<Logger>(shared_resources_->rank(), options_)},
       progress_thread_{std::move(progress_thread)} {
     shared_resources_->logger = logger_.get();
@@ -1219,7 +1324,15 @@ std::unique_ptr<Communicator::Future> UCXX::send(
         msg->size(),
         tag_with_rank(shared_resources_->rank(), static_cast<int>(tag))
     );
-    return std::make_unique<Future>(req, std::move(msg));
+    auto const nbytes = msg->size();
+    return std::make_unique<Future>(
+        req,
+        std::move(msg),
+        Future::RequestOperation::TagSend,
+        Future::MemoryRole::Source,
+        nbytes,
+        MemoryType::HOST
+    );
 }
 
 std::unique_ptr<Communicator::Future> UCXX::send(
@@ -1230,7 +1343,16 @@ std::unique_ptr<Communicator::Future> UCXX::send(
     auto req = get_endpoint(rank)->tagSend(
         msg->data(), msg->size, tag_with_rank(shared_resources_->rank(), tag)
     );
-    return std::make_unique<Future>(req, std::move(msg));
+    auto const nbytes = msg->size;
+    auto const memory_type = msg->mem_type();
+    return std::make_unique<Future>(
+        req,
+        std::move(msg),
+        Future::RequestOperation::TagSend,
+        Future::MemoryRole::Source,
+        nbytes,
+        memory_type
+    );
 }
 
 std::unique_ptr<Communicator::Future> UCXX::recv(
@@ -1248,7 +1370,16 @@ std::unique_ptr<Communicator::Future> UCXX::recv(
         tag_with_rank(rank, tag),
         ::ucxx::TagMaskFull
     );
-    return std::make_unique<Future>(req, std::move(recv_buffer));
+    auto const nbytes = recv_buffer->size;
+    auto const memory_type = recv_buffer->mem_type();
+    return std::make_unique<Future>(
+        req,
+        std::move(recv_buffer),
+        Future::RequestOperation::TagRecv,
+        Future::MemoryRole::Destination,
+        nbytes,
+        memory_type
+    );
 }
 
 std::unique_ptr<Communicator::Future> UCXX::recv_sync_host_data(
@@ -1263,7 +1394,15 @@ std::unique_ptr<Communicator::Future> UCXX::recv_sync_host_data(
         tag_with_rank(rank, tag),
         ::ucxx::TagMaskFull
     );
-    return std::make_unique<Future>(req, std::move(synced_buffer));
+    auto const nbytes = synced_buffer->size();
+    return std::make_unique<Future>(
+        req,
+        std::move(synced_buffer),
+        Future::RequestOperation::TagRecv,
+        Future::MemoryRole::Destination,
+        nbytes,
+        MemoryType::HOST
+    );
 }
 
 std::pair<std::unique_ptr<std::vector<std::uint8_t>>, Rank> UCXX::recv_any(Tag tag) {
@@ -1287,6 +1426,13 @@ std::pair<std::unique_ptr<std::vector<std::uint8_t>>, Rank> UCXX::recv_any(Tag t
         progress_worker();
     }
     req->checkError();
+    record_completed_request(
+        req,
+        Future::RequestOperation::TagRecv,
+        Future::MemoryRole::Destination,
+        info.length,
+        MemoryType::HOST
+    );
 
     return {std::move(msg), sender_rank};
 }
@@ -1311,6 +1457,13 @@ std::unique_ptr<std::vector<std::uint8_t>> UCXX::recv_from(Rank src, Tag tag) {
         progress_worker();
     }
     req->checkError();
+    record_completed_request(
+        req,
+        Future::RequestOperation::TagRecv,
+        Future::MemoryRole::Destination,
+        info.length,
+        MemoryType::HOST
+    );
 
     return msg;
 }
@@ -1324,10 +1477,11 @@ UCXX::test_some(std::vector<std::unique_ptr<Communicator::Future>>& future_vecto
     std::vector<std::size_t> indices;
     indices.reserve(future_vector.size());
     for (std::size_t i = 0; i < future_vector.size(); i++) {
-        auto ucxx_future = dynamic_cast<Future const*>(future_vector[i].get());
+        auto ucxx_future = dynamic_cast<Future*>(future_vector[i].get());
         RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
         if (ucxx_future->req_->isCompleted()) {
             ucxx_future->req_->checkError();
+            record_completed_request(*ucxx_future);
             indices.push_back(i);
         } else {
             // We rely on this API returning completed futures in order,
@@ -1363,10 +1517,11 @@ std::vector<std::size_t> UCXX::test_some(
     progress_worker();
     std::vector<std::size_t> completed;
     for (auto const& [key, future] : future_map) {
-        auto ucxx_future = dynamic_cast<Future const*>(future.get());
+        auto ucxx_future = dynamic_cast<Future*>(future.get());
         RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
         if (ucxx_future->req_->isCompleted()) {
             ucxx_future->req_->checkError();
+            record_completed_request(*ucxx_future);
             completed.push_back(key);
         }
     }
@@ -1379,6 +1534,9 @@ bool UCXX::test(std::unique_ptr<Communicator::Future>& future) {
     progress_worker();
     auto flag = ucxx_future->req_->isCompleted();
     ucxx_future->req_->checkError();
+    if (flag) {
+        record_completed_request(*ucxx_future);
+    }
     return flag;
 }
 
@@ -1422,6 +1580,7 @@ std::unique_ptr<Buffer> UCXX::wait(std::unique_ptr<Communicator::Future> future)
         progress_worker();
     }
     ucxx_future->req_->checkError();
+    record_completed_request(*ucxx_future);
     ucxx_future->data_buffer_->unlock();
     return std::move(ucxx_future->data_buffer_);
 }
@@ -1430,6 +1589,7 @@ std::unique_ptr<Buffer> UCXX::release_data(std::unique_ptr<Communicator::Future>
     auto ucxx_future = dynamic_cast<Future*>(future.get());
     RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
     RAPIDSMPF_EXPECTS(ucxx_future->data_buffer_ != nullptr, "future has no data");
+    record_completed_request(*ucxx_future);
     ucxx_future->data_buffer_->unlock();
     return std::move(ucxx_future->data_buffer_);
 }
@@ -1440,7 +1600,52 @@ std::unique_ptr<std::vector<std::uint8_t>> UCXX::release_sync_host_data(
     auto ucxx_future = dynamic_cast<Future*>(future.get());
     RAPIDSMPF_EXPECTS(ucxx_future != nullptr, "future isn't a UCXX::Future");
     RAPIDSMPF_EXPECTS(ucxx_future->synced_host_data_ != nullptr, "future has no data");
+    record_completed_request(*ucxx_future);
     return std::move(ucxx_future->synced_host_data_);
+}
+
+void UCXX::record_completed_request(Future& future) {
+    if (future.request_stats_recorded_) {
+        return;
+    }
+    record_completed_request(
+        future.req_,
+        future.operation_,
+        future.memory_role_,
+        future.nbytes_,
+        future.fallback_memory_type_
+    );
+    future.request_stats_recorded_ = true;
+}
+
+void UCXX::record_completed_request(
+    std::shared_ptr<::ucxx::Request> const& req,
+    Future::RequestOperation operation,
+    Future::MemoryRole memory_role,
+    std::size_t nbytes,
+    std::optional<MemoryType> fallback_memory_type
+) {
+    auto stats = progress_thread_->statistics();
+    if (!request_attributes_ || stats == nullptr || !stats->enabled()) {
+        return;
+    }
+
+    auto memory_type =
+        request_memory_type_name(UCS_MEMORY_TYPE_UNKNOWN, fallback_memory_type);
+    std::string debug_component{"no-queryable-request"};
+    try {
+        auto const attributes = req->queryAttributes();
+        memory_type =
+            request_memory_type_name(attributes.memoryType, fallback_memory_type);
+        debug_component = sanitize_stat_component(attributes.debugString);
+    } catch (::ucxx::NoElemError const&) {
+    } catch (::ucxx::UnsupportedError const&) {
+        debug_component = "request-attributes-disabled";
+    }
+
+    auto const stat_name = request_stat_name(operation, memory_role, memory_type);
+    stats->add_bytes_stat(stat_name, nbytes);
+    stats->add_bytes_stat(stat_name + "-debug-" + debug_component, nbytes);
 }
 
 std::string UCXX::str() const {
@@ -1477,7 +1682,9 @@ std::shared_ptr<UCXX> UCXX::split() {
     auto context = shared_resources_->get_context();
 
     // Create a new worker using the same context
-    auto worker = context->createWorker(false);
+    auto worker = ::ucxx::experimental::createWorker(context)
+                      .requestAttributes(request_attributes_)
+                      .build();
     worker->setProgressThreadStartCallback(create_cuda_context_callback, nullptr);
     worker->startProgressThread(true);
 

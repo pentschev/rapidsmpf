@@ -4,8 +4,11 @@
  */
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include <ucxx/api.h>
@@ -88,8 +91,8 @@ class InitializedRank {
  * @param remote_address Host/port pair or worker address identifying the remote UCXX
  * listener or worker. Used only by non-root ranks to connect to a previously initialized
  * root rank, for which the default `std::nullopt` is specified.
- * @param options The options to use for the communicator, currently supports only
- * `"ucxx_progress_mode"`.
+ * @param options The options to use for the communicator. Supports
+ * `"ucxx_progress_mode"` and `"ucxx_request_attributes"`.
  * @return a unique pointer to an InitializedRank object.
  *
  * @throws std::logic_error if the `remote_address` is an invalid object.
@@ -122,13 +125,46 @@ class UCXX final : public Communicator {
 
       public:
         /**
+         * @brief UCXX request operation kind used for request-attribute metrics.
+         */
+        enum class RequestOperation : std::uint8_t {
+            TagSend,
+            TagRecv,
+        };
+
+        /**
+         * @brief Local memory role used for request-attribute metrics.
+         */
+        enum class MemoryRole : std::uint8_t {
+            Source,
+            Destination,
+        };
+
+        /**
          * @brief Construct a Future from a data buffer.
          *
          * @param req The UCXX request handle for the operation.
          * @param data_buffer A unique pointer to the data buffer.
+         * @param operation UCXX operation kind for request-attribute metrics.
+         * @param memory_role Local memory role for request-attribute metrics.
+         * @param nbytes Number of bytes communicated by the request.
+         * @param fallback_memory_type Known local memory type used when UCX did not
+         * provide queryable attributes for this request.
          */
-        Future(std::shared_ptr<::ucxx::Request> req, std::unique_ptr<Buffer> data_buffer)
-            : req_{std::move(req)}, data_buffer_{std::move(data_buffer)} {}
+        Future(
+            std::shared_ptr<::ucxx::Request> req,
+            std::unique_ptr<Buffer> data_buffer,
+            RequestOperation operation,
+            MemoryRole memory_role,
+            std::size_t nbytes,
+            std::optional<MemoryType> fallback_memory_type
+        )
+            : req_{std::move(req)},
+              data_buffer_{std::move(data_buffer)},
+              operation_{operation},
+              memory_role_{memory_role},
+              nbytes_{nbytes},
+              fallback_memory_type_{fallback_memory_type} {}
 
         /**
          * @brief Construct a Future from synchronized host data.
@@ -138,12 +174,26 @@ class UCXX final : public Communicator {
          *
          * @param req The UCXX request handle for the operation.
          * @param synced_host_data A unique pointer to a vector containing host memory.
+         * @param operation UCXX operation kind for request-attribute metrics.
+         * @param memory_role Local memory role for request-attribute metrics.
+         * @param nbytes Number of bytes communicated by the request.
+         * @param fallback_memory_type Known local memory type used when UCX did not
+         * provide queryable attributes for this request.
          */
         Future(
             std::shared_ptr<::ucxx::Request> req,
-            std::unique_ptr<std::vector<std::uint8_t>> synced_host_data
+            std::unique_ptr<std::vector<std::uint8_t>> synced_host_data,
+            RequestOperation operation,
+            MemoryRole memory_role,
+            std::size_t nbytes,
+            std::optional<MemoryType> fallback_memory_type
         )
-            : req_{std::move(req)}, synced_host_data_{std::move(synced_host_data)} {}
+            : req_{std::move(req)},
+              synced_host_data_{std::move(synced_host_data)},
+              operation_{operation},
+              memory_role_{memory_role},
+              nbytes_{nbytes},
+              fallback_memory_type_{fallback_memory_type} {}
 
         ~Future() noexcept override = default;
 
@@ -152,6 +202,11 @@ class UCXX final : public Communicator {
         std::unique_ptr<Buffer> data_buffer_;
         // Dedicated storage for host data that is valid at the time of construction.
         std::unique_ptr<std::vector<std::uint8_t>> synced_host_data_;
+        RequestOperation operation_;
+        MemoryRole memory_role_;
+        std::size_t nbytes_;
+        std::optional<MemoryType> fallback_memory_type_;
+        bool request_stats_recorded_{false};
     };
 
     /**
@@ -338,11 +393,20 @@ class UCXX final : public Communicator {
   private:
     std::shared_ptr<SharedResources> shared_resources_;
     config::Options options_;
+    bool request_attributes_{false};
     std::shared_ptr<Logger> logger_;
     std::shared_ptr<ProgressThread> progress_thread_;
 
     std::shared_ptr<::ucxx::Endpoint> get_endpoint(Rank rank);
     void progress_worker();
+    void record_completed_request(Future& future);
+    void record_completed_request(
+        std::shared_ptr<::ucxx::Request> const& req,
+        Future::RequestOperation operation,
+        Future::MemoryRole memory_role,
+        std::size_t nbytes,
+        std::optional<MemoryType> fallback_memory_type
+    );
 };
 
 }  // namespace ucxx

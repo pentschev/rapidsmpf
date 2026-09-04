@@ -170,7 +170,7 @@ coro::task<void> MemoryReserveOrWait::periodic_memory_check() {
     // Helper that returns the memory available for new reservations, clamped so
     // negative values become zero.
     auto memory_available = [this]() -> std::size_t {
-        std::int64_t const ret = br_->memory_available_for_reservation(mem_type_);
+        std::int64_t const ret = br_->memory_available(mem_type_);
         return safe_cast<std::size_t>(std::max(ret, std::int64_t{0}));
     };
 

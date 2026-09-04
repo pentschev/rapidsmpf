@@ -80,8 +80,7 @@ std::size_t SpillManager::spill_unsafe(std::size_t amount) {
 
 std::size_t SpillManager::spill_to_make_headroom_unsafe(std::int64_t headroom) {
     // TODO: check other memory types.
-    std::int64_t const available =
-        br_->memory_available_for_reservation(MemoryType::DEVICE);
+    std::int64_t available = br_->memory_available(MemoryType::DEVICE);
     if (headroom <= available) {
         return 0;
     }

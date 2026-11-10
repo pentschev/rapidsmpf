@@ -110,6 +110,7 @@ class MPI final : public Communicator {
 
       private:
         MPI_Request req_;
+        bool is_receive_{false};  ///< Whether this is a receive, which can be cancelled.
         // TODO: these buffers are mutually exclusive and looks similar to
         // Buffer::storage_.
         std::unique_ptr<Buffer> data_buffer_;
@@ -130,7 +131,7 @@ class MPI final : public Communicator {
         std::shared_ptr<ProgressThread> progress_thread,
         std::shared_ptr<Logger> logger);
 
-    ~MPI() noexcept override = default;
+    ~MPI() noexcept override;
 
     /**
      * @copydoc Communicator::rank
@@ -266,6 +267,21 @@ class MPI final : public Communicator {
      * @copydoc Communicator::str
      */
     [[nodiscard]] std::string str() const override;
+
+  protected:
+    /**
+     * @copydoc Communicator::retired_future_completed
+     */
+    [[nodiscard]] bool retired_future_completed(
+        Communicator::Future& future
+    ) noexcept override;
+
+    /**
+     * @copydoc Communicator::cancel_retired_future
+     *
+     * Receives are cancelled with `MPI_Cancel()`.
+     */
+    void cancel_retired_future(Communicator::Future& future) noexcept override;
 
   private:
     MPI_Comm comm_;

@@ -150,6 +150,7 @@ class UCXX final : public Communicator {
 
       private:
         std::shared_ptr<::ucxx::Request> req_;
+        bool is_receive_{false};  ///< Whether this is a receive, which can be cancelled.
         std::unique_ptr<Buffer> data_buffer_;
         // Dedicated storage for host data that is valid at the time of construction.
         std::unique_ptr<std::vector<std::uint8_t>> synced_host_data_;
@@ -337,6 +338,22 @@ class UCXX final : public Communicator {
      * @return A new UCXX communicator with a single rank.
      */
     std::shared_ptr<UCXX> split();
+
+  protected:
+    /**
+     * @copydoc Communicator::retired_future_completed
+     */
+    [[nodiscard]] bool retired_future_completed(
+        Communicator::Future& future
+    ) noexcept override;
+
+    /**
+     * @copydoc Communicator::cancel_retired_future
+     *
+     * Cancels the UCXX request of receives, `retired_future_completed()` progresses
+     * the worker.
+     */
+    void cancel_retired_future(Communicator::Future& future) noexcept override;
 
   private:
     std::shared_ptr<SharedResources> shared_resources_;

@@ -183,6 +183,44 @@ MPI::MPI(
     check_mpi_thread_support();
 }
 
+namespace {
+/// @return Whether MPI calls may still be made.
+bool mpi_usable() noexcept {
+    int finalized{1};
+    MPI_Finalized(&finalized);
+    return finalized == 0;
+}
+}  // namespace
+
+MPI::~MPI() noexcept {
+    // Once MPI is finalized, e.g., at interpreter exit, nothing can complete anymore:
+    // the base class leaks the retired futures right away.
+    if (mpi_usable()) {
+        release_retired_futures();
+    }
+}
+
+bool MPI::retired_future_completed(Communicator::Future& future) noexcept {
+    auto* mpi_future = dynamic_cast<Future*>(&future);
+    if (mpi_future == nullptr || !mpi_usable()) {
+        return false;
+    }
+    int done{0};
+    MPI_Test(&mpi_future->req_, &done, MPI_STATUS_IGNORE);
+    return done != 0;
+}
+
+void MPI::cancel_retired_future(Communicator::Future& future) noexcept {
+    auto* mpi_future = dynamic_cast<Future*>(&future);
+    // A cancelled receive completes locally, unless it matched a message before being
+    // cancelled, in which case it completes with the message.
+    if (mpi_future != nullptr && mpi_usable() && mpi_future->is_receive_
+        && mpi_future->req_ != MPI_REQUEST_NULL)
+    {
+        MPI_Cancel(&mpi_future->req_);
+    }
+}
+
 std::unique_ptr<Communicator::Future> MPI::send(
     std::unique_ptr<std::vector<std::uint8_t>> msg, Rank rank, Tag tag
 ) {
@@ -234,7 +272,9 @@ std::unique_ptr<Communicator::Future> MPI::recv(
     mpi_recv_impl(
         rank, tag, recv_buffer->exclusive_data_access(), recv_buffer->size, comm_, &req
     );
-    return std::make_unique<Future>(req, std::move(recv_buffer));
+    auto future = std::make_unique<Future>(req, std::move(recv_buffer));
+    future->is_receive_ = true;
+    return future;
 }
 
 std::unique_ptr<Communicator::Future> MPI::recv_sync_host_data(
@@ -247,7 +287,9 @@ std::unique_ptr<Communicator::Future> MPI::recv_sync_host_data(
     );
     MPI_Request req;
     mpi_recv_impl(rank, tag, synced_buffer->data(), synced_buffer->size(), comm_, &req);
-    return std::make_unique<Future>(req, std::move(synced_buffer));
+    auto future = std::make_unique<Future>(req, std::move(synced_buffer));
+    future->is_receive_ = true;
+    return future;
 }
 
 std::pair<std::unique_ptr<std::vector<std::uint8_t>>, Rank> MPI::recv_any(Tag tag) {

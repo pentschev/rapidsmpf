@@ -1325,7 +1325,9 @@ std::unique_ptr<Communicator::Future> UCXX::recv(
                        ::ucxx::TagMaskFull
                    )
                    .build();
-    return std::make_unique<Future>(req, std::move(recv_buffer));
+    auto future = std::make_unique<Future>(req, std::move(recv_buffer));
+    future->is_receive_ = true;
+    return future;
 }
 
 std::unique_ptr<Communicator::Future> UCXX::recv_sync_host_data(
@@ -1342,7 +1344,9 @@ std::unique_ptr<Communicator::Future> UCXX::recv_sync_host_data(
                        ::ucxx::TagMaskFull
                    )
                    .build();
-    return std::make_unique<Future>(req, std::move(synced_buffer));
+    auto future = std::make_unique<Future>(req, std::move(synced_buffer));
+    future->is_receive_ = true;
+    return future;
 }
 
 std::pair<std::unique_ptr<std::vector<std::uint8_t>>, Rank> UCXX::recv_any(Tag tag) {
@@ -1541,7 +1545,39 @@ std::string UCXX::str() const {
 UCXX::~UCXX() noexcept {
     auto& log = logger();
     log->trace("UCXX destructor");
+    // Before stopping the progress thread, which progresses the retired futures.
+    release_retired_futures();
     shared_resources_->get_worker()->stopProgressThread();
+}
+
+bool UCXX::retired_future_completed(Communicator::Future& future) noexcept {
+    auto* ucxx_future = dynamic_cast<Future*>(&future);
+    if (ucxx_future == nullptr) {
+        return false;
+    }
+    try {
+        if (!ucxx_future->req_->isCompleted()) {
+            // Without a UCX progress thread, nothing else may progress the request.
+            shared_resources_->progress_worker();
+        }
+        return ucxx_future->req_->isCompleted();
+    } catch (...) {
+        return false;
+    }
+}
+
+void UCXX::cancel_retired_future(Communicator::Future& future) noexcept {
+    auto* ucxx_future = dynamic_cast<Future*>(&future);
+    if (ucxx_future == nullptr || !ucxx_future->is_receive_) {
+        return;
+    }
+    try {
+        if (!ucxx_future->req_->isCompleted()) {
+            ucxx_future->req_->cancel();
+        }
+    } catch (...) {
+        // Best effort, the future is leaked if it does not complete.
+    }
 }
 
 void UCXX::progress_worker() {

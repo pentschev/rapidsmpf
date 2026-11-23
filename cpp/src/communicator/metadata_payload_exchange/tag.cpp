@@ -383,6 +383,16 @@ TagMetadataPayloadExchange::setup_data_receives() {
                 // and wait for the buffer to be ready. This is necessary to ensure
                 // messages are received in the order they are sent from this rank.
                 if (!tag_msg.message->data()->is_latest_write_done()) {
+                    // Diagnostic: a host receive buffer whose stream-ordered pinned
+                    // allocation is not ready yet. Before the pinned write-event fix,
+                    // UCX would have written into it right away. Counted once per
+                    // progress poll that finds it not ready (not once per message), so
+                    // only "zero vs non-zero" is meaningful.
+                    if (tag_msg.message->data()->mem_type() != MemoryType::DEVICE) {
+                        statistics_->add_stat(
+                            "metadata-payload-exchange-host-recv-not-ready-polls", 1
+                        );
+                    }
                     break;
                 }
 
